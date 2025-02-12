@@ -61,7 +61,7 @@ def run_bot():
         if message.author.bot:
             return
 
-        if message.content.startswith('//play'):
+        if message.content.startswith('//play') or message.content.startswith('//p'):
             try:
                 if message.author.voice is None or message.author.voice.channel is None:
                     await message.channel.send('You need to be in a voice channel!')
@@ -147,6 +147,7 @@ def run_bot():
         elif message.content.startswith('//stop'):
             try:
                 if message.guild.id in voice_clients:
+                    is_loop = False
                     voice_clients[message.guild.id].stop()
                     await message.channel.send("⏹️ Music stopped.")
                 else:
