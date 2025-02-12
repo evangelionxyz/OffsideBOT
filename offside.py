@@ -11,7 +11,7 @@ def run_bot():
 
     current_song = None
     current_guild_id = None
-    is_loop = True  # control flag for looping
+    is_loop = False  # control flag for looping
 
     TOKEN = os.getenv('discord_token')
     client = discord.Client(intents=discord.Intents.all())
