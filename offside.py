@@ -1,10 +1,9 @@
+import asyncio
+import yt_dlp
+import traceback
 import discord 
 from discord.ext import commands
-import asyncio
-import os
-import yt_dlp
 from dotenv import load_dotenv
-import traceback
 from collections import deque
 
 def run_bot():
@@ -14,23 +13,30 @@ def run_bot():
     is_loop = {}
     current_songs = {}
 
-    TOKEN = os.getenv('discord_token')
+    with open('token.txt', 'r') as f:
+        TOKEN = f.read().strip()
+
     client = discord.Client(intents=discord.Intents.all())
 
     voice_clients = {}
+    
     yt_dl_options = {
         'format': 'bestaudio/best',
-        'noplaylist': True,
+        'noplaylist': False,
         'nocheckcertificate': True,
         'ignoreerrors': False,
         'logtostderr': False,
         'quiet': True,
         'no_warnings': True,
-        'extractaudio': True,
-        'audioformat': 'mp3',
-        'preferredcodec': 'mp3',
-        'default_search': 'auto'
+        'default_search': 'auto',
+        'cookiefile': 'cookies.txt',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
     }
+
     ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 
     ffmpeg_options = {
@@ -76,7 +82,7 @@ def run_bot():
 
         guild_id = message.guild.id
 
-        if message.content.startswith('//play'):
+        if message.content.startswith('!!play'):
             try:
                 if message.author.voice is None or message.author.voice.channel is None:
                     await message.channel.send('You need to be in a voice channel!')
@@ -90,7 +96,7 @@ def run_bot():
                     voice_client = await message.author.voice.channel.connect()
                     voice_clients[guild_id] = voice_client
 
-                query = message.content[len('//play '):].strip()
+                query = message.content[len('!!play '):].strip()
                 
                 try:
                     await message.channel.send(f'🔍 Searching for `{query}`...')
@@ -136,7 +142,7 @@ def run_bot():
                 traceback.print_exc()
                 await message.channel.send(f"⚠️ An error occurred: {str(e)}")
 
-        elif message.content.startswith('//queue'):
+        elif message.content.startswith('!!queue'):
             if guild_id in queues and queues[guild_id]:
                 queue_list = "\n".join([
                     f"{i+1}. {song['title']}"
@@ -147,21 +153,21 @@ def run_bot():
             else:
                 await message.channel.send("Queue is empty!")
 
-        elif message.content.startswith('//skip'):
+        elif message.content.startswith('!!skip'):
             if guild_id in voice_clients and voice_clients[guild_id].is_playing():
                 voice_clients[guild_id].stop()  # This will trigger play_next_song
                 await message.channel.send("⏭️ Skipped to next song.")
             else:
                 await message.channel.send("❌ Nothing to skip.")
 
-        elif message.content.startswith('//clear'):
+        elif message.content.startswith('!!clear'):
             if guild_id in queues:
                 queues[guild_id].clear()
                 await message.channel.send("🗑️ Queue cleared.")
             else:
                 await message.channel.send("❌ No queue to clear.")
 
-        elif message.content.startswith('//pause'):
+        elif message.content.startswith('!!pause'):
             try:
                 if guild_id in voice_clients and voice_clients[guild_id].is_playing():
                     voice_clients[guild_id].pause()
@@ -172,7 +178,7 @@ def run_bot():
                 print(f"Error during pause: {str(e)}")
                 traceback.print_exc()
 
-        elif message.content.startswith('//resume'):
+        elif message.content.startswith('!!resume'):
             try:
                 if guild_id in voice_clients and voice_clients[guild_id].is_paused():
                     voice_clients[guild_id].resume()
@@ -183,12 +189,12 @@ def run_bot():
                 print(f"Error during resume: {str(e)}")
                 traceback.print_exc()
 
-        elif message.content.startswith('//loop'):
+        elif message.content.startswith('!!loop'):
             is_loop[guild_id] = not is_loop.get(guild_id, False)
             status = "enabled" if is_loop[guild_id] else "disabled"
             await message.channel.send(f"🔄 Loop mode {status}")
 
-        elif message.content.startswith('//stop'):
+        elif message.content.startswith('!!stop'):
             try:
                 if guild_id in voice_clients:
                     voice_clients[guild_id].stop()
@@ -199,6 +205,34 @@ def run_bot():
             except Exception as e:
                 print(f"Error during stop: {str(e)}")
                 traceback.print_exc()
+
+        elif message.content.startswith('!!disconnect'):
+            if guild_id in voice_clients:
+                await voice_clients[guild_id].disconnect()
+                voice_clients.pop(guild_id, None)
+                queues.pop(guild_id, None)
+                current_songs.pop(guild_id, None)
+                is_loop.pop(guild_id, None)
+                await message.channel.send("🔌 Disconnected from voice channel.")
+            else:
+                await message.channel.send("❌ Not connected to any voice channel.")
+        elif message.content.startswith('!!help'):
+            help_text = (
+                "Offside BOT\n"
+                "`Here are the commands you can use:\n"
+                "- !!play <song name or URL> - Play a song\n"
+                "- !!queue ------------------- Show the current queue\n"
+                "- !!skip -------------------- Skip to the next song\n"
+                "- !!clear ------------------- Clear the queue\n"
+                "- !!pause ------------------- Pause the music\n"
+                "- !!resume ------------------ Resume the music\n"
+                "- !!loop -------------------- Toggle loop mode\n"
+                "- !!stop -------------------- Stop the music and clear the queue\n"
+                "- !!disconnect -------------- Disconnect from the voice channel\n"
+                "\nDeveloped with ❤️ by @evangelion.xyz`"
+
+            )
+            await message.channel.send(help_text)
 
     @client.event
     async def on_voice_state_update(member, before, after):
