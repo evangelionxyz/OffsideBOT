@@ -4,7 +4,7 @@
 ``` bash
 sudo apt update
 sudo apt install ffmpeg
-pip install discord yt-dlp dotenv
+pip install discord yt-dlp dotenv spotipy
 ```
 
 ## Discord token

@@ -1,17 +1,26 @@
 import asyncio
+import re
 import yt_dlp
 import traceback
 import discord 
+from spotipy import Spotify
+from spotipy.oauth2 import SpotifyClientCredentials
 from discord.ext import commands
 from dotenv import load_dotenv
 from collections import deque
 
 def run_bot():
+
+    sp = Spotify(auth_manager=SpotifyClientCredentials())
+
+
+
     load_dotenv()
 
     queues = {}
     is_loop = {}
     current_songs = {}
+    disconnect_timers = {}
 
     with open('token.txt', 'r') as f:
         TOKEN = f.read().strip()
@@ -44,8 +53,24 @@ def run_bot():
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
     }
 
+    def start_disconnect_timer(guild_id):
+        if guild_id in disconnect_timers:
+            disconnect_timers[guild_id].cancel()
+
+        async def disconnect():
+            await asyncio.sleep(120) # minutes
+            if guild_id in voice_clients and not voice_clients[guild_id].is_playing():
+                await voice_clients[guild_id].disconnect()
+                voice_clients.pop(guild_id, None)
+                queues.pop(guild_id, None)
+                current_songs.pop(guild_id, None)
+                is_loop.pop(guild_id, None)
+                print(f'Auto-disconnected from {guild_id} due to inactivity.')
+
+            task = asyncio.create_task(disconnect())
+            disconnect_timers[guild_id] = task
+
     async def play_next_song(guild_id):
-        """Play the next song in the queue"""
         if guild_id not in voice_clients:
             return
 
@@ -70,6 +95,8 @@ def run_bot():
                     client.loop
                 ).result()
             )
+        else: 
+            start_disconnect_timer(guild_id)
 
     @client.event
     async def on_ready():
@@ -99,8 +126,18 @@ def run_bot():
                 query = message.content[len('!!play '):].strip()
                 
                 try:
-                    await message.channel.send(f'🔍 Searching for `{query}`...')
-                    
+                    if 'open.spotify.com/track' in query:
+                        match = re.search(r'https?://open\.spotify\.com/track/([a-zA-Z0-9]+)', query)
+                        if match:
+                            track_id = match.group(1)
+                            track = sp.track(track_id)
+                            track_title = track['name']
+                            track_artist = track['artists'][0]['name']
+                            query = f"{track_title} {track_artist}"
+                            await message.channel.send(f"🎧 Found Spotify track: `{track_title}` by `{track_artist}`. Searching on YouTube...")
+                    else:
+                        await message.channel.send(f'🔍 Searching for `{query}`...')
+                        
                     loop = asyncio.get_event_loop()
                     data = await loop.run_in_executor(
                         None, 
@@ -243,6 +280,9 @@ def run_bot():
             queues.pop(guild_id, None)
             current_songs.pop(guild_id, None)
             is_loop.pop(guild_id, None)
+            if guild_id in disconnect_timers:
+                disconnect_timers[guild_id].cancel()
+                disconnect_timers.pop(guild_id, None)
 
     client.run(TOKEN)
 
