@@ -10,25 +10,22 @@ from dotenv import load_dotenv
 from collections import deque
 
 def run_bot():
+    load_dotenv()
 
     sp = Spotify(auth_manager=SpotifyClientCredentials())
-
-
-
-    load_dotenv()
 
     queues = {}
     is_loop = {}
     current_songs = {}
     disconnect_timers = {}
+    voice_clients = {}
 
     with open('token.txt', 'r') as f:
         TOKEN = f.read().strip()
 
     client = discord.Client(intents=discord.Intents.all())
-
-    voice_clients = {}
     
+    ## YouTube-DL options
     yt_dl_options = {
         'format': 'bestaudio/best',
         'noplaylist': False,
@@ -45,32 +42,38 @@ def run_bot():
             'preferredquality': '192',
         }],
     }
-
     ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 
+    # FFmpeg options for audio playback
+    # These options ensure that the bot can handle streams and reconnect if necessary
     ffmpeg_options = {
         'options': '-vn',
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
     }
 
-    def start_disconnect_timer(guild_id):
+    # Function to start a disconnect timer
+    # This will disconnect the bot from the voice channel after 2 minutes of inactivity
+    def start_disconnect_timer(guild_id, message):
         if guild_id in disconnect_timers:
             disconnect_timers[guild_id].cancel()
 
         async def disconnect():
-            await asyncio.sleep(120) # minutes
+            await asyncio.sleep(120) # 2 minutes
             if guild_id in voice_clients and not voice_clients[guild_id].is_playing():
                 await voice_clients[guild_id].disconnect()
                 voice_clients.pop(guild_id, None)
                 queues.pop(guild_id, None)
                 current_songs.pop(guild_id, None)
                 is_loop.pop(guild_id, None)
-                print(f'Auto-disconnected from {guild_id} due to inactivity.')
 
-            task = asyncio.create_task(disconnect())
-            disconnect_timers[guild_id] = task
+                await message.channel.send(f'Auto-disconnected from voice channel due to inactivity.')
 
-    async def play_next_song(guild_id):
+        task = asyncio.create_task(disconnect())
+        disconnect_timers[guild_id] = task
+
+
+    # Function to play the next song in the queue
+    async def play_next_song(guild_id, message):
         if guild_id not in voice_clients:
             return
 
@@ -78,29 +81,32 @@ def run_bot():
             next_song = queues[guild_id].popleft()
             current_songs[guild_id] = next_song
             
-            voice_clients[guild_id].play(
-                discord.FFmpegPCMAudio(next_song['url'], **ffmpeg_options),
+            voice_clients[guild_id].play(discord.FFmpegPCMAudio(next_song['url'], **ffmpeg_options),
                 after=lambda e: asyncio.run_coroutine_threadsafe(
-                    play_next_song(guild_id),
-                    client.loop
-                ).result()
-            )
+                    play_next_song(guild_id, message), client.loop).result())
+            
+            await message.channel.send(f"Now playing: `{next_song['title']}`")
+
         elif guild_id in is_loop and is_loop[guild_id] and guild_id in current_songs:
-            # if loop is enabled and we have a current song, replay it
             song = current_songs[guild_id]
-            voice_clients[guild_id].play(
-                discord.FFmpegPCMAudio(song['url'], **ffmpeg_options),
+            voice_clients[guild_id].play(discord.FFmpegPCMAudio(song['url'], **ffmpeg_options),
                 after=lambda e: asyncio.run_coroutine_threadsafe(
-                    play_next_song(guild_id),
-                    client.loop
-                ).result()
-            )
-        else: 
-            start_disconnect_timer(guild_id)
+                    play_next_song(guild_id, message), client.loop).result())
+            
+            await message.channel.send(f"Now playing in looping: `{song['title']}`")
+
+        else:
+            await message.channel.send("No more songs in the queue.")
+            start_disconnect_timer(guild_id, message)
+
 
     @client.event
     async def on_ready():
         print(f'{client.user} is now jamming.')
+        print(f'Connected to {len(client.guilds)} guilds.')
+        for guild in client.guilds:
+            print(f' - {guild.name} (ID: {guild.id})')
+
 
     @client.event
     async def on_message(message):
@@ -134,9 +140,9 @@ def run_bot():
                             track_title = track['name']
                             track_artist = track['artists'][0]['name']
                             query = f"{track_title} {track_artist}"
-                            await message.channel.send(f"🎧 Found Spotify track: `{track_title}` by `{track_artist}`. Searching on YouTube...")
+                            await message.channel.send(f"Found Spotify track: `{track_title}` by `{track_artist}`. Searching on YouTube...")
                     else:
-                        await message.channel.send(f'🔍 Searching for `{query}`...')
+                        await message.channel.send(f'Searching for `{query}`...')
                         
                     loop = asyncio.get_event_loop()
                     data = await loop.run_in_executor(
@@ -145,12 +151,12 @@ def run_bot():
                     )
                     
                     if 'entries' not in data or not data['entries']:
-                        await message.channel.send("❌ No results found.")
+                        await message.channel.send("No results found.")
                         return
 
                     video = data['entries'][0]
                     if not video:
-                        await message.channel.send("❌ Could not find video.")
+                        await message.channel.send("Could not find video.")
                         return
 
                     song_info = {
@@ -164,20 +170,18 @@ def run_bot():
 
                     # if nothing is playing, start playing
                     if not voice_clients[guild_id].is_playing():
-                        await play_next_song(guild_id)
-                        await message.channel.send(f"🎶 Now playing: `{song_info['title']}`")
+                        await play_next_song(guild_id, message)
                     else:
-                        await message.channel.send(f"📝 Added to queue (#{position}): `{song_info['title']}`")
+                        await message.channel.send(f"Added to queue (#{position}): `{song_info['title']}`")
 
                 except Exception as e:
                     print(f"Error during playback setup: {str(e)}")
                     traceback.print_exc()
-                    await message.channel.send(f"⚠️ Error: {str(e)}")
+                    await message.channel.send(f"Error: {str(e)}")
 
             except Exception as e:
-                print(f"Outer error: {str(e)}")
                 traceback.print_exc()
-                await message.channel.send(f"⚠️ An error occurred: {str(e)}")
+                print(f"Outer error: {str(e)}")
 
         elif message.content.startswith('!!queue'):
             if guild_id in queues and queues[guild_id]:
@@ -193,24 +197,24 @@ def run_bot():
         elif message.content.startswith('!!skip'):
             if guild_id in voice_clients and voice_clients[guild_id].is_playing():
                 voice_clients[guild_id].stop()  # This will trigger play_next_song
-                await message.channel.send("⏭️ Skipped to next song.")
+                await message.channel.send("Skipped to next song.")
             else:
-                await message.channel.send("❌ Nothing to skip.")
+                await message.channel.send("Nothing to skip.")
 
         elif message.content.startswith('!!clear'):
             if guild_id in queues:
                 queues[guild_id].clear()
-                await message.channel.send("🗑️ Queue cleared.")
+                await message.channel.send("Queue cleared.")
             else:
-                await message.channel.send("❌ No queue to clear.")
+                await message.channel.send("No queue to clear.")
 
         elif message.content.startswith('!!pause'):
             try:
                 if guild_id in voice_clients and voice_clients[guild_id].is_playing():
                     voice_clients[guild_id].pause()
-                    await message.channel.send("⏸️ Music paused.")
+                    await message.channel.send("Music paused.")
                 else:
-                    await message.channel.send("❌ No music is playing.")
+                    await message.channel.send("No music is playing.")
             except Exception as e:
                 print(f"Error during pause: {str(e)}")
                 traceback.print_exc()
@@ -219,9 +223,9 @@ def run_bot():
             try:
                 if guild_id in voice_clients and voice_clients[guild_id].is_paused():
                     voice_clients[guild_id].resume()
-                    await message.channel.send("▶️ Music resumed.")
+                    await message.channel.send("Music resumed.")
                 else:
-                    await message.channel.send("❌ No music is paused.")
+                    await message.channel.send("No music is paused.")
             except Exception as e:
                 print(f"Error during resume: {str(e)}")
                 traceback.print_exc()
@@ -229,16 +233,22 @@ def run_bot():
         elif message.content.startswith('!!loop'):
             is_loop[guild_id] = not is_loop.get(guild_id, False)
             status = "enabled" if is_loop[guild_id] else "disabled"
-            await message.channel.send(f"🔄 Loop mode {status}")
+            await message.channel.send(f"Loop mode {status}")
 
         elif message.content.startswith('!!stop'):
             try:
                 if guild_id in voice_clients:
                     voice_clients[guild_id].stop()
                     queues[guild_id].clear()  # Clear the queue
-                    await message.channel.send("⏹️ Music stopped and queue cleared.")
+                    await message.channel.send("Music stopped and queue cleared.")
+
+                    start_disconnect_timer(guild_id, message)
                 else:
-                    await message.channel.send("❌ No music is playing.")
+                    await message.channel.send("No music is playing.")
+                    if guild_id in disconnect_timers:
+                        disconnect_timers[guild_id].cancel()
+                        disconnect_timers.pop(guild_id, None)
+
             except Exception as e:
                 print(f"Error during stop: {str(e)}")
                 traceback.print_exc()
@@ -250,9 +260,10 @@ def run_bot():
                 queues.pop(guild_id, None)
                 current_songs.pop(guild_id, None)
                 is_loop.pop(guild_id, None)
-                await message.channel.send("🔌 Disconnected from voice channel.")
+                await message.channel.send("Disconnected from voice channel.")
             else:
-                await message.channel.send("❌ Not connected to any voice channel.")
+                await message.channel.send("Not connected to any voice channel.")
+        
         elif message.content.startswith('!!help'):
             help_text = (
                 "Offside BOT\n"
@@ -275,11 +286,12 @@ def run_bot():
     async def on_voice_state_update(member, before, after):
         if member == client.user and after.channel is None:
             guild_id = before.channel.guild.id
-            print('Bot disconnected. Clearing voice client and queue.')
+            
             voice_clients.pop(guild_id, None)
             queues.pop(guild_id, None)
             current_songs.pop(guild_id, None)
             is_loop.pop(guild_id, None)
+
             if guild_id in disconnect_timers:
                 disconnect_timers[guild_id].cancel()
                 disconnect_timers.pop(guild_id, None)
