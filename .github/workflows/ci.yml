@@ -70,7 +70,7 @@ jobs:
             NEW_IMAGE_ID=$(docker images -q ghcr.io/${{ env.IMAGE_NAME }}:latest)
             docker stop offside-bot || true
             docker rm offside-bot || true
-            docker run -d --name offside-bot --restart unless-stopped --env-file ~/OffsideBot/.env \
+            docker run -d --name offside-bot --restart unless-stopped --env-file ~/OffsideBOT/.env \
               ghcr.io/${{ env.IMAGE_NAME }}:latest
             if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$NEW_IMAGE_ID" ]; then
               docker rmi "$OLD_IMAGE_ID" || true
