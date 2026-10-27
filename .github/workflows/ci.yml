@@ -1,0 +1,77 @@
+name: CI & Auto Release
+
+on:
+  push:
+    branches: ["master"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: evangelionxyz/offside-bot
+
+jobs:
+  build-and-push:
+    name: Build and Push Offside Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in GitHub Container Registry (GHCR)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./
+          file: ./dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-to-dewacloud:
+    name: Deploy on DewaCloud via SSH
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy container via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEWACLOUD_SSH_HOST || vars.DEWACLOUD_SSH_HOST }}
+          port: ${{ secrets.DEWACLOUD_SSH_PORT || vars.DEWACLOUD_SSH_PORT || 22 }}
+          username: ${{ secrets.DEWACLOUD_SSH_USER || vars.DEWACLOUD_SSH_USER }}
+          key: ${{ secrets.DEWACLOUD_SSH_PRIVATE_KEY || vars.DEWACLOUD_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            OLD_IMAGE_ID=$(docker images -q ghcr.io/${{ env.IMAGE_NAME }}:latest)
+            docker pull ghcr.io/${{ env.IMAGE_NAME }}:latest
+            NEW_IMAGE_ID=$(docker images -q ghcr.io/${{ env.IMAGE_NAME }}:latest)
+            docker stop offside-bot || true
+            docker rm offside-bot || true
+            docker run -d --name offside-bot --restart unless-stopped --env-file ~/OffsideBot/.env \
+              ghcr.io/${{ env.IMAGE_NAME }}:latest
+            if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$NEW_IMAGE_ID" ]; then
+              docker rmi "$OLD_IMAGE_ID" || true
+            fi
