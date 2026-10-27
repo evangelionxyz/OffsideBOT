@@ -3,3 +3,7 @@
 cookies.txt
 token.txt
 venv
+
+# Added by cargo
+
+/target

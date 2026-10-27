@@ -1,0 +1,10 @@
+services:
+    offside-bot:
+        image: ghcr.io/evangelionxyz/offside-bot
+        build:
+            context: ./
+            dockerfile: dockerfile
+        container_name: offside-bot
+        restart: unless-stopped
+        env_file:
+            - .env
