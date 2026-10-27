@@ -39,6 +39,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+ENV BOT_ENV=production
+ENV CACHE_DIR=/app/cache
+
+RUN mkdir -p /app/cache
+
 COPY --from=builder /usr/src/offside-bot/target/release/offside-bot /app/offside-bot
 
 CMD ["/app/offside-bot"]

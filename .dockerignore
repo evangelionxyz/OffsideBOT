@@ -1,4 +1,5 @@
 target/
+cache/
 .git/
 .gitignore
 .env
