@@ -246,6 +246,35 @@ impl SongCache {
             return None;
         }
 
+        // If the query was not a direct URL, verify that the cached song is not a stale
+        // music video with extra footage / behind-the-scenes when user didn't request that
+        let is_direct_url = query.starts_with("http://") || query.starts_with("https://");
+        if !is_direct_url {
+            let q_lower = query.to_lowercase();
+            let wants_bts = q_lower.contains("behind the scene")
+                || q_lower.contains("bts")
+                || q_lower.contains("making of")
+                || q_lower.contains("extra footage")
+                || q_lower.contains("blooper");
+            let wants_video = q_lower.contains("video")
+                || q_lower.contains("mv")
+                || q_lower.contains("music video");
+
+            let title_lower = entry.title.to_lowercase();
+            let is_stale_bts = !wants_bts
+                && (title_lower.contains("behind the scene")
+                    || title_lower.contains("making of")
+                    || title_lower.contains("extra footage")
+                    || title_lower.contains("blooper"));
+            let is_stale_mv = !wants_video
+                && (title_lower.contains("official music video")
+                    || title_lower.contains("official video"));
+
+            if is_stale_bts || is_stale_mv {
+                return None;
+            }
+        }
+
         entry.last_accessed = now;
         let song = SongInfo {
             id: entry.id.clone(),
@@ -722,6 +751,209 @@ fn prefetch_song_in_background(song: SongInfo, cache: Arc<SongCache>) {
     });
 }
 
+#[derive(Clone, Debug)]
+struct SearchCandidate {
+    id: String,
+    title: String,
+    channel: String,
+    duration: Option<u64>,
+    url: String,
+}
+
+async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate>> {
+    let mut cmd = tokio::process::Command::new(ytdl_program());
+    cmd.args([
+        "--flat-playlist",
+        "--print",
+        "%(id)s\t%(title)s\t%(channel,uploader)s\t%(duration)s\t%(webpage_url,url)s",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-check-certificate",
+    ]);
+    if Path::new("cookies.txt").exists() {
+        cmd.args(["--cookies", "cookies.txt"]);
+    }
+    cmd.arg(target);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow!("Could not run yt-dlp: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("yt-dlp error: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut candidates = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split('\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let id = parts[0].trim().to_string();
+        if id.is_empty() || id == "NA" {
+            continue;
+        }
+        let title = parts[1].trim().to_string();
+        if title.is_empty() || title == "NA" {
+            continue;
+        }
+        let channel = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
+        let duration = parts.get(3).and_then(|s| s.trim().parse::<u64>().ok());
+        let url = parts
+            .get(4)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "NA")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+
+        candidates.push(SearchCandidate {
+            id,
+            title,
+            channel,
+            duration,
+            url,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn score_candidate(
+    candidate: &SearchCandidate,
+    rank: usize,
+    query: &str,
+    wants_bts: bool,
+    wants_video: bool,
+) -> i32 {
+    let title_lower = candidate.title.to_lowercase();
+    let channel_lower = candidate.channel.to_lowercase();
+    let q_lower = query.to_lowercase();
+
+    let mut score: i32 = 0;
+
+    // 1. YouTube ranking preference (higher in search results gets a small head start)
+    score += (10 - (rank.min(10) as i32)) * 2;
+
+    // 2. Reject behind the scenes, bloopers, making-of, extra footage, interviews, reactions
+    if !wants_bts {
+        let bts_markers = [
+            "behind the scene",
+            "behind the scenes",
+            "making of",
+            "extra footage",
+            "deleted scene",
+            "blooper",
+            "bloopers",
+            "outtake",
+            "outtakes",
+            "b-roll",
+            "interview",
+            "reaction",
+            "reacts",
+            "review",
+            "short film",
+            "teaser",
+            "trailer",
+        ];
+        if bts_markers.iter().any(|&m| title_lower.contains(m))
+            || title_lower.contains("(bts)")
+            || title_lower.contains("[bts]")
+            || title_lower.contains(" bts ")
+            || title_lower.starts_with("bts ")
+            || title_lower.ends_with(" bts")
+        {
+            return -10000;
+        }
+    }
+
+    // 3. Official music video penalty when user just wants the audio track
+    // (Music videos frequently contain talking, dialogue, intro skits, movie interludes, gunfights)
+    if !wants_video {
+        if title_lower.contains("official music video")
+            || title_lower.contains("official video")
+            || title_lower.contains("music video")
+            || title_lower.contains("(mv)")
+            || title_lower.contains("[mv]")
+        {
+            score -= 40;
+        }
+    }
+
+    // 4. Boost audio-only and clean music releases
+    if channel_lower.ends_with("- topic") || channel_lower.contains("- topic") {
+        // YouTube's official label track (Topic channel)
+        score += 60;
+    }
+    if title_lower.contains("official audio") {
+        score += 50;
+    } else if title_lower.contains("audio") || title_lower.contains("(audio)") || title_lower.contains("[audio]") {
+        score += 35;
+    }
+
+    if title_lower.contains("official lyric video") || title_lower.contains("lyric video") || title_lower.contains("lyrics") {
+        score += 30;
+    }
+
+    if title_lower.contains("visualizer") || title_lower.contains("official visualizer") {
+        score += 25;
+    }
+
+    if title_lower.contains("album version") || title_lower.contains("original mix") || title_lower.contains("studio version") || title_lower.contains("clean") {
+        score += 15;
+    }
+
+    // 5. Duration sanity checks
+    if let Some(dur) = candidate.duration {
+        // Less than 30s is likely a snippet, teaser, or ringtone
+        if dur < 30 {
+            score -= 100;
+        }
+
+        let is_long_format_query = q_lower.contains("hour")
+            || q_lower.contains("mix")
+            || q_lower.contains("compilation")
+            || q_lower.contains("podcast")
+            || q_lower.contains("full album")
+            || q_lower.contains("lofi")
+            || q_lower.contains("lo-fi")
+            || q_lower.contains("chill")
+            || q_lower.contains("relax")
+            || q_lower.contains("study")
+            || q_lower.contains("bgm")
+            || q_lower.contains("stream");
+
+        if !is_long_format_query {
+            if dur > 900 {
+                score -= 500;
+            } else if dur > 600 {
+                score -= 100;
+            }
+        }
+    }
+
+    // 6. Query keyword match relevance
+    let query_words: Vec<&str> = q_lower
+        .split_whitespace()
+        .filter(|w| w.len() > 1 && *w != "audio" && *w != "the" && *w != "and" && *w != "song")
+        .collect();
+
+    for word in &query_words {
+        if title_lower.contains(word) || channel_lower.contains(word) {
+            score += 15;
+        }
+    }
+
+    score
+}
+
 async fn extract_song_info(state: &BotState, query: &str) -> Result<SongInfo> {
     // 1. Check if this exact query or URL is already in the 7-day cache
     if let Some((cached_song, _path)) = state.cache.get_by_query(query).await {
@@ -745,56 +977,121 @@ async fn extract_song_info(state: &BotState, query: &str) -> Result<SongInfo> {
         }
     }
 
-    let target = if query.starts_with("http://") || query.starts_with("https://") {
-        query.to_string()
+    let is_direct_url = query.starts_with("http://") || query.starts_with("https://");
+
+    if is_direct_url {
+        let candidates = fetch_search_candidates(query).await?;
+        let first = candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No results found for URL."))?;
+
+        let final_url = if first.url.starts_with("http://") || first.url.starts_with("https://") {
+            first.url
+        } else {
+            format!("https://www.youtube.com/watch?v={}", first.id)
+        };
+
+        let song = SongInfo {
+            id: first.id,
+            url: final_url,
+            title: first.title,
+        };
+
+        state.cache.remember_query(query, &song.id).await;
+        return Ok(song);
+    }
+
+    let q_lower = query.to_lowercase();
+    let wants_bts = q_lower.contains("behind the scene")
+        || q_lower.contains("bts")
+        || q_lower.contains("making of")
+        || q_lower.contains("extra footage")
+        || q_lower.contains("blooper")
+        || q_lower.contains("deleted scene")
+        || q_lower.contains("interview");
+
+    let wants_video = q_lower.contains("video")
+        || q_lower.contains("mv")
+        || q_lower.contains("music video")
+        || q_lower.contains("short film");
+
+    let already_audio_focused = q_lower.contains("audio")
+        || q_lower.contains("lyrics")
+        || q_lower.contains("lyric")
+        || q_lower.contains("topic");
+
+    // First attempt: fine-tuned audio search if user did not request BTS or video explicitly
+    let target = if wants_bts || wants_video || already_audio_focused {
+        format!("ytsearch10:{query}")
     } else {
-        format!("ytsearch1:{query}")
+        format!("ytsearch10:{query} audio")
     };
 
-    let mut cmd = tokio::process::Command::new(ytdl_program());
-    cmd.args([
-        "--flat-playlist",
-        "--print",
-        "%(id)s",
-        "--print",
-        "%(title)s",
-        "--print",
-        "%(webpage_url,url)s",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificate",
-    ]);
-    if Path::new("cookies.txt").exists() {
-        cmd.args(["--cookies", "cookies.txt"]);
+    let candidates = fetch_search_candidates(&target).await.unwrap_or_default();
+
+    let mut scored: Vec<(i32, SearchCandidate)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(rank, c)| {
+            let score = score_candidate(&c, rank, query, wants_bts, wants_video);
+            (score, c)
+        })
+        .filter(|(score, _)| *score > -5000)
+        .collect();
+
+    // If searching with "audio" returned no valid candidates, fall back to plain query
+    if scored.is_empty() && !wants_bts && !wants_video && !already_audio_focused {
+        let fallback_target = format!("ytsearch10:{query}");
+        if let Ok(fallback_candidates) = fetch_search_candidates(&fallback_target).await {
+            scored = fallback_candidates
+                .into_iter()
+                .enumerate()
+                .map(|(rank, c)| {
+                    let score = score_candidate(&c, rank, query, wants_bts, wants_video);
+                    (score, c)
+                })
+                .filter(|(score, _)| *score > -5000)
+                .collect();
+        }
     }
-    cmd.arg(&target);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| anyhow!("Could not run yt-dlp: {e}"))?;
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("yt-dlp error: {}", stderr.trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
-
-    let id = lines
+    let best = scored
+        .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("No results found."))?
-        .to_string();
-    let title = lines
-        .next()
-        .ok_or_else(|| anyhow!("No results found."))?
-        .to_string();
-    let url = lines.next().unwrap_or(&target).to_string();
+        .map(|(_, c)| c)
+        .ok_or_else(|| anyhow!("No results found."))?;
 
-    state.cache.remember_query(query, &id).await;
+    let final_title = if !best.channel.is_empty()
+        && best.channel != "NA"
+        && (best.channel.to_lowercase().ends_with("- topic") || best.channel.to_lowercase().contains("- topic"))
+    {
+        let clean_artist = best
+            .channel
+            .replace("- Topic", "")
+            .replace("- topic", "")
+            .trim()
+            .to_string();
+        if !clean_artist.is_empty() && !best.title.to_lowercase().contains(&clean_artist.to_lowercase()) {
+            format!("{clean_artist} - {}", best.title)
+        } else {
+            best.title
+        }
+    } else {
+        best.title
+    };
 
-    Ok(SongInfo { id, url, title })
+    let final_url = format!("https://www.youtube.com/watch?v={}", best.id);
+
+    state.cache.remember_query(query, &best.id).await;
+
+    Ok(SongInfo {
+        id: best.id,
+        url: final_url,
+        title: final_title,
+    })
 }
 
 struct TrackEndNotifier {
@@ -1539,23 +1836,32 @@ impl EventHandler for Handler {
                 )
                 .await;
         } else if content.starts_with("!!help") {
-            let help_text = concat!(
-                "Offside BOT\n",
-                "`Here are the commands you can use:\n",
-                "- !!play <song name or URL> - Play a song\n",
-                "- !!queue ------------------- Show the current queue\n",
-                "- !!skip -------------------- Skip to the next song\n",
-                "- !!clear ------------------- Clear the queue\n",
-                "- !!pause ------------------- Pause the music\n",
-                "- !!resume ------------------ Resume the music\n",
-                "- !!loop -------------------- Toggle loop mode\n",
-                "- !!stop -------------------- Stop the music and clear the queue\n",
-                "- !!stay <hour|forever> ----- Stay in voice channel for N hours or forever\n",
-                "- !!disconnect -------------- Disconnect from the voice channel\n",
-                "- !!cache ------------------- Show song cache usage\n",
-                "- !!dev [on|off] ------------ Toggle dev mode (pauses prod bot)\n",
-                "\nDeveloped with ❤️ by @evangelion.xyz`"
-            );
+            let help_text = "\
+## **Offside BOT**
+> *High-performance music streaming with smart audio search*
+
+### **Playback**
+• `!!play <song | URL>` — Play a song or add to queue (YouTube & Spotify)
+• `!!pause` — Pause current playback
+• `!!resume` — Resume playback
+• `!!skip` — Skip to the next song
+• `!!stop` — Stop playback and clear the queue
+• `!!loop` — Toggle loop mode for the current track
+
+### **Queue**
+• `!!queue` — Show currently playing song and upcoming queue
+• `!!clear` — Clear all songs waiting in the queue
+
+### **Voice Channel**
+• `!!stay <hours | forever | off>` — Set inactivity stay duration (e.g. `!!stay 24`, `!!stay forever`)
+• `!!disconnect` — Leave the voice channel
+
+### **System**
+• `!!cache` — View audio disk cache usage
+• `!!dev [on | off]` — Toggle local dev mode / production standby
+• `!!help` — Show this command reference
+
+-# Developed with ❤️ by @evangelion.xyz";
 
             if let Err(why) = msg.channel_id.say(&ctx.http, help_text).await {
                 eprintln!("Error sending message: {why:?}");
@@ -1652,5 +1958,55 @@ async fn main() {
 
     if let Err(why) = client.start().await {
         eprintln!("Client error: {why:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_audio_search_thriller() {
+        let state = BotState::new(true);
+        let res = extract_song_info(&state, "Michael Jackson Thriller").await.unwrap();
+        println!("Resolved Thriller: id={}, title={}, url={}", res.id, res.title, res.url);
+        // Ensure it did not pick the 14-minute official 4K music video (id: sOnqjkJTMaA)
+        assert_ne!(res.id, "sOnqjkJTMaA", "Must not pick the music video with movie intro/extra footage");
+    }
+
+    #[tokio::test]
+    async fn test_audio_search_paparazzi() {
+        let state = BotState::new(true);
+        let res = extract_song_info(&state, "Lady Gaga Paparazzi").await.unwrap();
+        println!("Resolved Paparazzi: id={}, title={}, url={}", res.id, res.title, res.url);
+        // Ensure it did not pick the 7-minute music video with skits (d2smz_1L2_0 / qStFzmQGQNw)
+        assert_ne!(res.id, "d2smz_1L2_0");
+        assert_ne!(res.id, "qStFzmQGQNw");
+    }
+
+    #[tokio::test]
+    async fn test_audio_search_payphone() {
+        let state = BotState::new(true);
+        let res = extract_song_info(&state, "Maroon 5 Payphone").await.unwrap();
+        println!("Resolved Payphone: id={}, title={}, url={}", res.id, res.title, res.url);
+        // Ensure it did not pick the music video with bank robbery gunfight (id: KRaWnd3LJfs)
+        assert_ne!(res.id, "KRaWnd3LJfs");
+    }
+
+    #[tokio::test]
+    async fn test_direct_url_preserved() {
+        let state = BotState::new(true);
+        let url = "https://www.youtube.com/watch?v=sOnqjkJTMaA";
+        let res = extract_song_info(&state, url).await.unwrap();
+        assert_eq!(res.id, "sOnqjkJTMaA");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_bts_request() {
+        let state = BotState::new(true);
+        let res = extract_song_info(&state, "Michael Jackson Thriller making of behind the scenes").await.unwrap();
+        println!("Resolved explicit BTS: id={}, title={}", res.id, res.title);
+        let lower = res.title.to_lowercase();
+        assert!(lower.contains("making") || lower.contains("behind") || lower.contains("thriller"));
     }
 }
