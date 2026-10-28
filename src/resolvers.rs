@@ -300,6 +300,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_spotify_white_chorus_user_reported() {
+        let client = reqwest::Client::new();
+        // White Chorus - Ingatlah Aku Di Sini
+        let (title, artist) = fetch_spotify_track_public(&client, "4LyUgOxEfMBEWz4jZlcr0K")
+            .await
+            .unwrap();
+        println!("Spotify public resolved: {title} by {artist}");
+        assert_eq!(title, "Ingatlah Aku Di Sini");
+        assert_eq!(artist, "White Chorus");
+    }
+
+    #[tokio::test]
     async fn test_apple_music_resolver() {
         let client = reqwest::Client::new();
         // Rick Astley - Never Gonna Give You Up

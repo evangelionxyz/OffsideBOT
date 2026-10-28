@@ -170,88 +170,96 @@ impl EventHandler for Handler {
                 return;
             }
 
+            let original_query = query.clone();
+
             if query.contains("open.spotify.com/track") {
-                if let Some(caps) = self.state.spotify_regex.captures(&query) {
-                    if let Some(track_id_match) = caps.get(1) {
-                        match fetch_spotify_track(&self.state.http_client, track_id_match.as_str())
-                            .await
-                        {
-                            Ok((track_title, track_artist)) => {
-                                query = format!("{track_title} {track_artist}");
-                                let _ = msg
-                                    .channel_id
-                                    .say(
-                                        &ctx.http,
-                                        format!(
-                                            "Found Spotify track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
-                                        ),
-                                    )
-                                    .await;
-                            }
-                            Err(err) => {
-                                eprintln!("Error during Spotify lookup: {err:?}");
-                                let _ = msg
-                                    .channel_id
-                                    .say(&ctx.http, format!("Error: {err}"))
-                                    .await;
-                                return;
+                if self.state.cache.get_by_query(&query).await.is_none() {
+                    if let Some(caps) = self.state.spotify_regex.captures(&query) {
+                        if let Some(track_id_match) = caps.get(1) {
+                            match fetch_spotify_track(&self.state.http_client, track_id_match.as_str())
+                                .await
+                            {
+                                Ok((track_title, track_artist)) => {
+                                    query = format!("{track_artist} - {track_title}");
+                                    let _ = msg
+                                        .channel_id
+                                        .say(
+                                            &ctx.http,
+                                            format!(
+                                                "Found Spotify track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                Err(err) => {
+                                    eprintln!("Error during Spotify lookup: {err:?}");
+                                    let _ = msg
+                                        .channel_id
+                                        .say(&ctx.http, format!("Error: {err}"))
+                                        .await;
+                                    return;
+                                }
                             }
                         }
                     }
                 }
             } else if query.contains("music.apple.com") {
-                if let Some(caps) = self.state.apple_music_regex.captures(&query) {
-                    let track_id = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
-                    if let Some(track_id) = track_id {
-                        match fetch_apple_music_track(&self.state.http_client, track_id).await {
-                            Ok((track_title, track_artist)) => {
-                                query = format!("{track_title} {track_artist}");
-                                let _ = msg
-                                    .channel_id
-                                    .say(
-                                        &ctx.http,
-                                        format!(
-                                            "Found Apple Music track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
-                                        ),
-                                    )
-                                    .await;
-                            }
-                            Err(err) => {
-                                eprintln!("Error during Apple Music lookup: {err:?}");
-                                let _ = msg
-                                    .channel_id
-                                    .say(&ctx.http, format!("Error: {err}"))
-                                    .await;
-                                return;
+                if self.state.cache.get_by_query(&query).await.is_none() {
+                    if let Some(caps) = self.state.apple_music_regex.captures(&query) {
+                        let track_id = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+                        if let Some(track_id) = track_id {
+                            match fetch_apple_music_track(&self.state.http_client, track_id).await {
+                                Ok((track_title, track_artist)) => {
+                                    query = format!("{track_artist} - {track_title}");
+                                    let _ = msg
+                                        .channel_id
+                                        .say(
+                                            &ctx.http,
+                                            format!(
+                                                "Found Apple Music track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                Err(err) => {
+                                    eprintln!("Error during Apple Music lookup: {err:?}");
+                                    let _ = msg
+                                        .channel_id
+                                        .say(&ctx.http, format!("Error: {err}"))
+                                        .await;
+                                    return;
+                                }
                             }
                         }
                     }
                 }
             } else if query.contains("deezer.com") {
-                if let Some(caps) = self.state.deezer_regex.captures(&query) {
-                    if let Some(track_id_match) = caps.get(1) {
-                        match fetch_deezer_track(&self.state.http_client, track_id_match.as_str())
-                            .await
-                        {
-                            Ok((track_title, track_artist)) => {
-                                query = format!("{track_title} {track_artist}");
-                                let _ = msg
-                                    .channel_id
-                                    .say(
-                                        &ctx.http,
-                                        format!(
-                                            "Found Deezer track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
-                                        ),
-                                    )
-                                    .await;
-                            }
-                            Err(err) => {
-                                eprintln!("Error during Deezer lookup: {err:?}");
-                                let _ = msg
-                                    .channel_id
-                                    .say(&ctx.http, format!("Error: {err}"))
-                                    .await;
-                                return;
+                if self.state.cache.get_by_query(&query).await.is_none() {
+                    if let Some(caps) = self.state.deezer_regex.captures(&query) {
+                        if let Some(track_id_match) = caps.get(1) {
+                            match fetch_deezer_track(&self.state.http_client, track_id_match.as_str())
+                                .await
+                            {
+                                Ok((track_title, track_artist)) => {
+                                    query = format!("{track_artist} - {track_title}");
+                                    let _ = msg
+                                        .channel_id
+                                        .say(
+                                            &ctx.http,
+                                            format!(
+                                                "Found Deezer track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                Err(err) => {
+                                    eprintln!("Error during Deezer lookup: {err:?}");
+                                    let _ = msg
+                                        .channel_id
+                                        .say(&ctx.http, format!("Error: {err}"))
+                                        .await;
+                                    return;
+                                }
                             }
                         }
                     }
@@ -265,6 +273,9 @@ impl EventHandler for Handler {
 
             match extract_song_info(&self.state, &query).await {
                 Ok(song_info) => {
+                    if original_query != query {
+                        self.state.cache.remember_query(&original_query, &song_info.id).await;
+                    }
                     let title = song_info.title.clone();
                     let song_clone = song_info.clone();
                     let position = {

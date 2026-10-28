@@ -219,6 +219,29 @@ impl SongCache {
             if is_stale_bts || is_stale_mv {
                 return None;
             }
+
+            // Verify that the cached song title actually matches the query
+            let cached_title_words = crate::search::tokenize_words(&entry.title);
+            if let Some(pos) = query.find(" - ") {
+                let right = query[pos + 3..].trim();
+                let title_words = crate::search::tokenize_words(right);
+                let meaningful: Vec<&String> = title_words
+                    .iter()
+                    .filter(|w| (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !crate::search::STOP_WORDS.contains(&w.as_str()))
+                    .collect();
+                if !meaningful.is_empty() && !meaningful.iter().any(|w| cached_title_words.contains(w)) {
+                    return None;
+                }
+            } else {
+                let q_words = crate::search::tokenize_words(query);
+                let meaningful: Vec<&String> = q_words
+                    .iter()
+                    .filter(|w| (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !crate::search::STOP_WORDS.contains(&w.as_str()))
+                    .collect();
+                if !meaningful.is_empty() && !meaningful.iter().any(|w| cached_title_words.contains(w)) {
+                    return None;
+                }
+            }
         }
 
         entry.last_accessed = now;

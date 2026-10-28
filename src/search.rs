@@ -81,6 +81,21 @@ pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate
     Ok(candidates)
 }
 
+pub const STOP_WORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for",
+    "with", "by", "from", "ft", "feat", "featuring", "vs", "audio",
+    "official", "video", "song", "lyrics", "lyric", "remix", "version",
+];
+
+pub fn tokenize_words(text: &str) -> Vec<String> {
+    text.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub fn score_candidate(
     candidate: &SearchCandidate,
     rank: usize,
@@ -194,16 +209,110 @@ pub fn score_candidate(
         }
     }
 
-    // 6. Query keyword match relevance
-    let query_words: Vec<&str> = q_lower
-        .split_whitespace()
-        .filter(|w| w.len() > 1 && *w != "audio" && *w != "the" && *w != "and" && *w != "song")
+    // 6. Query keyword and title match relevance
+    let is_meaningful = |w: &str| {
+        (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !STOP_WORDS.contains(&w)
+    };
+
+    let q_clean_words: Vec<String> = tokenize_words(query)
+        .into_iter()
+        .filter(|w| is_meaningful(w.as_str()))
         .collect();
 
-    for word in &query_words {
-        if title_lower.contains(word) || channel_lower.contains(word) {
-            score += 15;
+    let candidate_title_words = tokenize_words(&candidate.title);
+    let candidate_channel_words = tokenize_words(&candidate.channel);
+
+    // If query has a clear separator like " - " or " by ", split into artist & title
+    let parts: Option<(&str, &str)> = if let Some(pos) = query.find(" - ") {
+        let left = query[..pos].trim();
+        let right = query[pos + 3..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            Some((left, right))
+        } else {
+            None
         }
+    } else if let Some(pos) = query.to_lowercase().find(" by ") {
+        let left = query[..pos].trim();
+        let right = query[pos + 4..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            Some((right, left)) // (artist, title)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((part_a, part_b)) = parts {
+        let words_a: Vec<String> = tokenize_words(part_a)
+            .into_iter()
+            .filter(|w| is_meaningful(w.as_str()))
+            .collect();
+        let words_b: Vec<String> = tokenize_words(part_b)
+            .into_iter()
+            .filter(|w| is_meaningful(w.as_str()))
+            .collect();
+
+        let in_a_title = words_a.iter().filter(|w| candidate_title_words.contains(w)).count();
+        let in_a_channel = words_a.iter().filter(|w| candidate_channel_words.contains(w)).count();
+        let has_a = in_a_title > 0 || in_a_channel > 0;
+
+        let in_b_title = words_b.iter().filter(|w| candidate_title_words.contains(w)).count();
+        let in_b_channel = words_b.iter().filter(|w| candidate_channel_words.contains(w)).count();
+        let has_b = in_b_title > 0 || in_b_channel > 0;
+
+        // If either part is completely missing from both title and channel, reject
+        if (!words_a.is_empty() && !has_a) || (!words_b.is_empty() && !has_b) {
+            return -10000;
+        }
+
+        // And the candidate title MUST contain at least some words from either part A or part B
+        if in_a_title == 0 && in_b_title == 0 {
+            return -10000;
+        }
+    } else if !q_clean_words.is_empty() {
+        // Unstructured query (e.g. "Ingatlah Aku Di Sini White Chorus")
+        let title_matches = q_clean_words
+            .iter()
+            .filter(|w| candidate_title_words.contains(w))
+            .count();
+        let total_matches = q_clean_words
+            .iter()
+            .filter(|w| candidate_title_words.contains(w) || candidate_channel_words.contains(w))
+            .count();
+
+        // Candidate title MUST contain at least one query word
+        if title_matches == 0 {
+            return -10000;
+        }
+
+        // If there are 3 or more query words, total coverage must be at least 50%
+        let cov = total_matches as f32 / q_clean_words.len() as f32;
+        if q_clean_words.len() >= 3 && cov < 0.5 {
+            return -10000;
+        }
+    }
+
+    // Award points for matched words
+    for word in &q_clean_words {
+        if candidate_title_words.contains(word) {
+            score += 18;
+        } else if candidate_channel_words.contains(word) {
+            score += 10;
+        } else {
+            // Slight penalty for missing query word
+            score -= 8;
+        }
+    }
+
+    let total_matches = q_clean_words
+        .iter()
+        .filter(|w| candidate_title_words.contains(w) || candidate_channel_words.contains(w))
+        .count();
+    if !q_clean_words.is_empty() && total_matches == q_clean_words.len() {
+        score += 40;
+    } else if !q_clean_words.is_empty() && (total_matches as f32 / q_clean_words.len() as f32) >= 0.75 {
+        score += 20;
     }
 
     score
@@ -276,13 +385,8 @@ pub async fn extract_song_info(state: &BotState, query: &str) -> Result<SongInfo
         || q_lower.contains("lyric")
         || q_lower.contains("topic");
 
-    // First attempt: fine-tuned audio search if user did not request BTS or video explicitly
-    let target = if wants_bts || wants_video || already_audio_focused {
-        format!("ytsearch10:{query}")
-    } else {
-        format!("ytsearch10:{query} audio")
-    };
-
+    // Primary search: search for the exact query requested
+    let target = format!("ytsearch10:{query}");
     let candidates = fetch_search_candidates(&target).await.unwrap_or_default();
 
     let mut scored: Vec<(i32, SearchCandidate)> = candidates
@@ -295,9 +399,10 @@ pub async fn extract_song_info(state: &BotState, query: &str) -> Result<SongInfo
         .filter(|(score, _)| *score > -5000)
         .collect();
 
-    // If searching with "audio" returned no valid candidates, fall back to plain query
+    // If searching returned no valid candidates with a good score, and user didn't request video/bts,
+    // try fallback search with "audio" keyword
     if scored.is_empty() && !wants_bts && !wants_video && !already_audio_focused {
-        let fallback_target = format!("ytsearch10:{query}");
+        let fallback_target = format!("ytsearch10:{query} audio");
         if let Ok(fallback_candidates) = fetch_search_candidates(&fallback_target).await {
             scored = fallback_candidates
                 .into_iter()
@@ -396,6 +501,42 @@ mod tests {
         println!("Resolved explicit BTS: id={}, title={}", res.id, res.title);
         let lower = res.title.to_lowercase();
         assert!(lower.contains("making") || lower.contains("behind") || lower.contains("thriller"));
+    }
+
+    #[tokio::test]
+    async fn test_audio_search_white_chorus_ingatlah_aku_di_sini() {
+        let state = BotState::new(true);
+        let res = extract_song_info(&state, "White Chorus - Ingatlah Aku Di Sini").await.unwrap();
+        println!("Resolved White Chorus: id={}, title={}", res.id, res.title);
+        // Must resolve to the actual song (kuWHPlpRFXY), NEVER to Minggu (ILq7QUKdST8)
+        assert_eq!(res.id, "kuWHPlpRFXY");
+        assert_ne!(res.id, "ILq7QUKdST8");
+    }
+
+    #[test]
+    fn test_candidate_scoring_rejects_wrong_song_by_same_artist() {
+        let wrong_candidate = SearchCandidate {
+            id: "ILq7QUKdST8".to_string(),
+            title: "White Chorus - Minggu ft. Dzulfahmi [Official Lyric Video]".to_string(),
+            channel: "White Chorus".to_string(),
+            duration: Some(224),
+            url: "https://www.youtube.com/watch?v=ILq7QUKdST8".to_string(),
+        };
+
+        let right_candidate = SearchCandidate {
+            id: "kuWHPlpRFXY".to_string(),
+            title: "White Chorus - Ingatlah Aku Di Sini [Official Lyric Video]".to_string(),
+            channel: "White Chorus".to_string(),
+            duration: Some(186),
+            url: "https://www.youtube.com/watch?v=kuWHPlpRFXY".to_string(),
+        };
+
+        let query = "White Chorus - Ingatlah Aku Di Sini";
+        let wrong_score = score_candidate(&wrong_candidate, 0, query, false, false);
+        let right_score = score_candidate(&right_candidate, 0, query, false, false);
+
+        assert!(wrong_score <= -5000, "Wrong song by same artist must be rejected, got score: {wrong_score}");
+        assert!(right_score > 50, "Correct song must receive strong positive score, got: {right_score}");
     }
 }
 
