@@ -3,8 +3,8 @@ mod config;
 mod handler;
 mod models;
 mod playback;
+mod resolvers;
 mod search;
-mod spotify;
 mod state;
 mod stream;
 

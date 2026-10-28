@@ -12,8 +12,8 @@ use serenity::{
 use crate::{
     models::StayMode,
     playback::{play_next_song, start_disconnect_timer},
+    resolvers::{fetch_apple_music_track, fetch_deezer_track, fetch_spotify_track},
     search::extract_song_info,
-    spotify::fetch_spotify_track,
     state::BotState,
     stream::prefetch_song_in_background,
 };
@@ -190,6 +190,63 @@ impl EventHandler for Handler {
                             }
                             Err(err) => {
                                 eprintln!("Error during Spotify lookup: {err:?}");
+                                let _ = msg
+                                    .channel_id
+                                    .say(&ctx.http, format!("Error: {err}"))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else if query.contains("music.apple.com") {
+                if let Some(caps) = self.state.apple_music_regex.captures(&query) {
+                    let track_id = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+                    if let Some(track_id) = track_id {
+                        match fetch_apple_music_track(&self.state.http_client, track_id).await {
+                            Ok((track_title, track_artist)) => {
+                                query = format!("{track_title} {track_artist}");
+                                let _ = msg
+                                    .channel_id
+                                    .say(
+                                        &ctx.http,
+                                        format!(
+                                            "Found Apple Music track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                eprintln!("Error during Apple Music lookup: {err:?}");
+                                let _ = msg
+                                    .channel_id
+                                    .say(&ctx.http, format!("Error: {err}"))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else if query.contains("deezer.com") {
+                if let Some(caps) = self.state.deezer_regex.captures(&query) {
+                    if let Some(track_id_match) = caps.get(1) {
+                        match fetch_deezer_track(&self.state.http_client, track_id_match.as_str())
+                            .await
+                        {
+                            Ok((track_title, track_artist)) => {
+                                query = format!("{track_title} {track_artist}");
+                                let _ = msg
+                                    .channel_id
+                                    .say(
+                                        &ctx.http,
+                                        format!(
+                                            "Found Deezer track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                eprintln!("Error during Deezer lookup: {err:?}");
                                 let _ = msg
                                     .channel_id
                                     .say(&ctx.http, format!("Error: {err}"))
@@ -542,7 +599,7 @@ impl EventHandler for Handler {
 > *High-performance music streaming with smart audio search*
 
 ### 🎶 **Playback**
-• `!!play <song | URL>` — Play a song or add to queue (YouTube & Spotify)
+• `!!play <song | URL>` — Play a song or add to queue (YouTube, Spotify, Apple Music, Deezer)
 • `!!pause` — Pause current playback
 • `!!resume` — Resume playback
 • `!!skip` — Skip to the next song

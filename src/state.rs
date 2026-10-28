@@ -27,6 +27,8 @@ pub struct BotState {
     pub bot_user_id: Mutex<Option<UserId>>,
     pub http_client: reqwest::Client,
     pub spotify_regex: Regex,
+    pub apple_music_regex: Regex,
+    pub deezer_regex: Regex,
     pub youtube_id_regex: Regex,
     pub cache: Arc<SongCache>,
     pub is_dev_instance: bool,
@@ -47,6 +49,10 @@ impl BotState {
             http_client: reqwest::Client::new(),
             spotify_regex: Regex::new(r"https?://open\.spotify\.com/track/([a-zA-Z0-9]+)")
                 .expect("Valid Spotify regex"),
+            apple_music_regex: Regex::new(r"[?&]i=(\d+)|/song/(?:[^/]+/)?(\d+)")
+                .expect("Valid Apple Music regex"),
+            deezer_regex: Regex::new(r"deezer\.com/(?:[a-zA-Z-]+/)?track/(\d+)")
+                .expect("Valid Deezer regex"),
             youtube_id_regex: Regex::new(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})")
                 .expect("Valid YouTube ID regex"),
             cache: Arc::new(SongCache::new(cache_dir)),

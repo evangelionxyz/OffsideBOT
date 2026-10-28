@@ -54,11 +54,13 @@ pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate
         if id.is_empty() || id == "NA" {
             continue;
         }
-        let title = parts[1].trim().to_string();
+        let title = crate::resolvers::decode_html_entities(parts[1].trim());
         if title.is_empty() || title == "NA" {
             continue;
         }
-        let channel = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
+        let channel = crate::resolvers::decode_html_entities(
+            parts.get(2).map(|s| s.trim()).unwrap_or(""),
+        );
         let duration = parts.get(3).and_then(|s| s.trim().parse::<u64>().ok());
         let url = parts
             .get(4)
