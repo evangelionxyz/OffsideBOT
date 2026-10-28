@@ -595,26 +595,21 @@ impl EventHandler for Handler {
                 .await;
         } else if content.starts_with("!!help") {
             let help_text = "\
-## 🎵 **Offside BOT**
-> *High-performance music streaming with smart audio search*
-
-### 🎶 **Playback**
+## **Offside BOT**
+### **Playback**
 • `!!play <song | URL>` — Play a song or add to queue (YouTube, Spotify, Apple Music, Deezer)
 • `!!pause` — Pause current playback
 • `!!resume` — Resume playback
 • `!!skip` — Skip to the next song
 • `!!stop` — Stop playback and clear the queue
 • `!!loop` — Toggle loop mode for the current track
-
-### 📋 **Queue**
+### **Queue**
 • `!!queue` — Show currently playing song and upcoming queue
 • `!!clear` — Clear all songs waiting in the queue
-
-### 🔊 **Voice Channel**
+### **Voice Channel**
 • `!!stay <hours | forever | off>` — Set inactivity stay duration (e.g. `!!stay 24`, `!!stay forever`)
 • `!!disconnect` — Leave the voice channel
-
-### ⚙️ **System**
+### **System**
 • `!!cache` — View audio disk cache usage
 • `!!dev [on | off]` — Toggle local dev mode / production standby
 • `!!help` — Show this command reference
