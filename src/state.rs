@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -14,17 +14,20 @@ use tokio::{sync::Mutex, task::AbortHandle};
 
 use crate::{
     cache::SongCache,
-    models::{ActiveTrack, SongInfo, StayMode},
+    models::{ActiveTrack, QueueEntry, SongInfo, StayMode},
 };
 
 pub struct BotState {
-    pub queues: Mutex<HashMap<GuildId, VecDeque<SongInfo>>>,
+    pub queues: Mutex<HashMap<GuildId, VecDeque<QueueEntry>>>,
     pub is_loop: Mutex<HashMap<GuildId, bool>>,
     pub stay_modes: Mutex<HashMap<GuildId, StayMode>>,
     pub current_songs: Mutex<HashMap<GuildId, SongInfo>>,
     pub current_tracks: Mutex<HashMap<GuildId, ActiveTrack>>,
     pub disconnect_timers: Mutex<HashMap<GuildId, AbortHandle>>,
     pub bot_user_id: Mutex<Option<UserId>>,
+    pub play_locks: Mutex<HashMap<GuildId, Arc<Mutex<()>>>>,
+    pub volumes: Mutex<HashMap<GuildId, f32>>,
+    pub next_ticket: AtomicU64,
     pub http_client: reqwest::Client,
     pub spotify_regex: Regex,
     pub apple_music_regex: Regex,
@@ -46,6 +49,9 @@ impl BotState {
             current_tracks: Mutex::new(HashMap::new()),
             disconnect_timers: Mutex::new(HashMap::new()),
             bot_user_id: Mutex::new(None),
+            play_locks: Mutex::new(HashMap::new()),
+            volumes: Mutex::new(HashMap::new()),
+            next_ticket: AtomicU64::new(1),
             http_client: reqwest::Client::new(),
             spotify_regex: Regex::new(r"https?://open\.spotify\.com/track/([a-zA-Z0-9]+)")
                 .expect("Valid Spotify regex"),
@@ -72,6 +78,16 @@ impl BotState {
         }
     }
 
+    /// Per-guild lock serializing every change to "what is playing" (play, skip, track end, stop).
+    pub async fn guild_lock(&self, guild_id: GuildId) -> Arc<Mutex<()>> {
+        self.play_locks
+            .lock()
+            .await
+            .entry(guild_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     pub async fn cancel_disconnect_timer(&self, guild_id: GuildId) {
         if let Some(abort_handle) = self.disconnect_timers.lock().await.remove(&guild_id) {
             abort_handle.abort();
@@ -87,6 +103,8 @@ impl BotState {
         self.current_songs.lock().await.remove(&guild_id);
         self.is_loop.lock().await.remove(&guild_id);
         self.stay_modes.lock().await.remove(&guild_id);
+        self.volumes.lock().await.remove(&guild_id);
+        self.play_locks.lock().await.remove(&guild_id);
         self.cancel_disconnect_timer(guild_id).await;
     }
 
@@ -115,18 +133,4 @@ impl BotState {
         }
         false
     }
-
-    pub async fn is_active(&self, guild_id: GuildId) -> bool {
-        let handle = {
-            let tracks = self.current_tracks.lock().await;
-            tracks.get(&guild_id).map(|t| t.handle.clone())
-        };
-        if let Some(handle) = handle {
-            if let Ok(info) = handle.get_info().await {
-                return matches!(info.playing, PlayMode::Play | PlayMode::Pause);
-            }
-        }
-        false
-    }
 }
-

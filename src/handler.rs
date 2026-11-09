@@ -1,25 +1,109 @@
 use std::{
-    collections::VecDeque,
     sync::{atomic::Ordering, Arc},
+    time::Duration,
 };
 
 use serenity::{
     async_trait,
     client::{Context, EventHandler},
-    model::{channel::Message, gateway::Ready, voice::VoiceState},
+    model::{
+        channel::Message,
+        gateway::Ready,
+        id::{GuildId, UserId},
+        voice::VoiceState,
+    },
 };
 
 use crate::{
     models::StayMode,
-    playback::{play_next_song, start_disconnect_timer},
+    playback::{
+        cancel_slot, clear_queue, fill_slot, remove_from_queue, reserve_slot, shuffle_queue,
+        skip_current, start_disconnect_timer, stop_playback, FillResult,
+    },
     resolvers::{fetch_apple_music_track, fetch_deezer_track, fetch_spotify_track},
     search::extract_song_info,
     state::BotState,
-    stream::prefetch_song_in_background,
 };
 
 pub struct Handler {
     pub state: Arc<BotState>,
+}
+
+/// Counts non-bot members in a voice channel using the gateway cache.
+fn humans_in_channel(
+    ctx: &Context,
+    guild_id: GuildId,
+    channel: u64,
+    bot_id: Option<UserId>,
+) -> usize {
+    ctx.cache
+        .guild(guild_id)
+        .map(|g| {
+            g.voice_states
+                .values()
+                .filter(|vs| vs.channel_id.map(|c| c.get()) == Some(channel))
+                .filter(|vs| Some(vs.user_id) != bot_id)
+                .count()
+        })
+        .unwrap_or(1)
+}
+
+/// True if the user is in the same voice channel as the bot (or the bot isn't connected).
+async fn in_bot_channel(ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool {
+    let user_channel = ctx
+        .cache
+        .guild(guild_id)
+        .and_then(|g| g.voice_states.get(&user_id).and_then(|vs| vs.channel_id))
+        .map(|c| c.get());
+
+    let Some(manager) = songbird::get(ctx).await else {
+        return true;
+    };
+    let Some(call) = manager.get(guild_id) else {
+        return true;
+    };
+    let bot_channel = call.lock().await.current_channel().map(|c| c.0.get());
+    bot_channel.is_none() || bot_channel == user_channel
+}
+
+/// Resolves Spotify / Apple Music / Deezer links to `(service, title, artist)`.
+/// Returns `Ok(None)` for anything that isn't one of those links.
+async fn resolve_external_link(
+    state: &BotState,
+    query: &str,
+) -> anyhow::Result<Option<(&'static str, String, String)>> {
+    if query.contains("open.spotify.com/track") {
+        if let Some(id) = state
+            .spotify_regex
+            .captures(query)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+        {
+            let (title, artist) = fetch_spotify_track(&state.http_client, id).await?;
+            return Ok(Some(("Spotify", title, artist)));
+        }
+    } else if query.contains("music.apple.com") {
+        if let Some(id) = state
+            .apple_music_regex
+            .captures(query)
+            .and_then(|c| c.get(1).or_else(|| c.get(2)))
+            .map(|m| m.as_str())
+        {
+            let (title, artist) = fetch_apple_music_track(&state.http_client, id).await?;
+            return Ok(Some(("Apple Music", title, artist)));
+        }
+    } else if query.contains("deezer.com") {
+        if let Some(id) = state
+            .deezer_regex
+            .captures(query)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+        {
+            let (title, artist) = fetch_deezer_track(&state.http_client, id).await?;
+            return Ok(Some(("Deezer", title, artist)));
+        }
+    }
+    Ok(None)
 }
 
 #[async_trait]
@@ -62,7 +146,59 @@ impl EventHandler for Handler {
                 }
                 self.state.cleanup_guild(guild_id).await;
             }
+            return;
         }
+
+        // Leave when everyone else has left the bot's voice channel
+        let Some(guild_id) = new.guild_id else {
+            return;
+        };
+        if Some(new.user_id) == bot_id {
+            return;
+        }
+        let Some(manager) = songbird::get(&ctx).await else {
+            return;
+        };
+        let Some(call) = manager.get(guild_id) else {
+            return;
+        };
+        let Some(bot_channel) = call.lock().await.current_channel().map(|c| c.0.get()) else {
+            return;
+        };
+        if humans_in_channel(&ctx, guild_id, bot_channel, bot_id) > 0 {
+            return;
+        }
+
+        let stay_mode = self
+            .state
+            .stay_modes
+            .lock()
+            .await
+            .get(&guild_id)
+            .copied()
+            .unwrap_or_default();
+        if matches!(stay_mode, StayMode::Forever) {
+            return;
+        }
+
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let Some(manager) = songbird::get(&ctx).await else {
+                return;
+            };
+            let Some(call) = manager.get(guild_id) else {
+                return;
+            };
+            let current = call.lock().await.current_channel().map(|c| c.0.get());
+            // Still in the same channel and still alone: leave
+            if current == Some(bot_channel)
+                && humans_in_channel(&ctx, guild_id, bot_channel, bot_id) == 0
+            {
+                state.cleanup_guild(guild_id).await;
+                let _ = manager.remove(guild_id).await;
+            }
+        });
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -115,7 +251,22 @@ impl EventHandler for Handler {
             return;
         }
 
-        if content.starts_with("!!play") {
+        let cmd = content.split_whitespace().next().unwrap_or("");
+
+        // Playback controls only work for users sitting in the bot's voice channel
+        const CHANNEL_GATED: &[&str] = &[
+            "!!play", "!!skip", "!!stop", "!!pause", "!!resume", "!!loop", "!!clear", "!!remove",
+            "!!shuffle", "!!volume", "!!stay", "!!disconnect",
+        ];
+        if CHANNEL_GATED.contains(&cmd) && !in_bot_channel(&ctx, guild_id, msg.author.id).await {
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, "You need to be in my voice channel to do that!")
+                .await;
+            return;
+        }
+
+        if cmd == "!!play" {
             let user_channel_id = ctx.cache.guild(guild_id).and_then(|guild| {
                 guild
                     .voice_states
@@ -131,10 +282,20 @@ impl EventHandler for Handler {
                 return;
             };
 
-            {
-                let mut queues = self.state.queues.lock().await;
-                queues.entry(guild_id).or_insert_with(VecDeque::new);
+            let query = content
+                .strip_prefix("!!play")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            if query.is_empty() {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "Usage: `!!play <song | URL>`")
+                    .await;
+                return;
             }
+
             {
                 let mut is_loop = self.state.is_loop.lock().await;
                 is_loop.entry(guild_id).or_insert(false);
@@ -145,158 +306,93 @@ impl EventHandler for Handler {
                 .expect("Songbird Voice client placed in at initialisation.");
 
             if manager.get(guild_id).is_none() {
-                if let Err(err) = manager.join(guild_id, connect_to).await {
-                    eprintln!("Error joining voice channel: {err:?}");
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, format!("Error: {err}"))
-                        .await;
+                match manager.join(guild_id, connect_to).await {
+                    Ok(call) => {
+                        let _ = call.lock().await.deafen(true).await;
+                    }
+                    Err(err) => {
+                        eprintln!("Error joining voice channel: {err:?}");
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("Error: {err}"))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            // Reserve the queue slot right away so order follows request order
+            let (ticket, position) = match reserve_slot(&self.state, guild_id, &query).await {
+                Ok(slot) => slot,
+                Err(reason) => {
+                    let _ = msg.channel_id.say(&ctx.http, reason).await;
                     return;
                 }
-            }
+            };
 
-            let mut query = content
-                .strip_prefix("!!play")
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let already_cached = self.state.cache.get_by_query(&query).await.is_some();
+            let mut search_query = query.clone();
 
-            if query.is_empty() {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "Searching for ``...")
-                    .await;
-                let _ = msg.channel_id.say(&ctx.http, "No results found.").await;
-                return;
-            }
+            let resolved = if already_cached {
+                Ok(None)
+            } else {
+                resolve_external_link(&self.state, &query).await
+            };
 
-            let original_query = query.clone();
-
-            if query.contains("open.spotify.com/track") {
-                if self.state.cache.get_by_query(&query).await.is_none() {
-                    if let Some(caps) = self.state.spotify_regex.captures(&query) {
-                        if let Some(track_id_match) = caps.get(1) {
-                            match fetch_spotify_track(&self.state.http_client, track_id_match.as_str())
-                                .await
-                            {
-                                Ok((track_title, track_artist)) => {
-                                    query = format!("{track_artist} - {track_title}");
-                                    let _ = msg
-                                        .channel_id
-                                        .say(
-                                            &ctx.http,
-                                            format!(
-                                                "Found Spotify track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                Err(err) => {
-                                    eprintln!("Error during Spotify lookup: {err:?}");
-                                    let _ = msg
-                                        .channel_id
-                                        .say(&ctx.http, format!("Error: {err}"))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
+            match resolved {
+                Ok(Some((service, track_title, track_artist))) => {
+                    search_query = format!("{track_artist} - {track_title}");
+                    let _ = msg
+                        .channel_id
+                        .say(
+                            &ctx.http,
+                            format!(
+                                "Found {service} track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
+                            ),
+                        )
+                        .await;
                 }
-            } else if query.contains("music.apple.com") {
-                if self.state.cache.get_by_query(&query).await.is_none() {
-                    if let Some(caps) = self.state.apple_music_regex.captures(&query) {
-                        let track_id = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
-                        if let Some(track_id) = track_id {
-                            match fetch_apple_music_track(&self.state.http_client, track_id).await {
-                                Ok((track_title, track_artist)) => {
-                                    query = format!("{track_artist} - {track_title}");
-                                    let _ = msg
-                                        .channel_id
-                                        .say(
-                                            &ctx.http,
-                                            format!(
-                                                "Found Apple Music track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                Err(err) => {
-                                    eprintln!("Error during Apple Music lookup: {err:?}");
-                                    let _ = msg
-                                        .channel_id
-                                        .say(&ctx.http, format!("Error: {err}"))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if query.contains("deezer.com") {
-                if self.state.cache.get_by_query(&query).await.is_none() {
-                    if let Some(caps) = self.state.deezer_regex.captures(&query) {
-                        if let Some(track_id_match) = caps.get(1) {
-                            match fetch_deezer_track(&self.state.http_client, track_id_match.as_str())
-                                .await
-                            {
-                                Ok((track_title, track_artist)) => {
-                                    query = format!("{track_artist} - {track_title}");
-                                    let _ = msg
-                                        .channel_id
-                                        .say(
-                                            &ctx.http,
-                                            format!(
-                                                "Found Deezer track: `{track_title}` by `{track_artist}`. Searching on YouTube..."
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                Err(err) => {
-                                    eprintln!("Error during Deezer lookup: {err:?}");
-                                    let _ = msg
-                                        .channel_id
-                                        .say(&ctx.http, format!("Error: {err}"))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if self.state.cache.get_by_query(&query).await.is_none() {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, format!("Searching for `{query}`..."))
-                    .await;
-            }
-
-            match extract_song_info(&self.state, &query).await {
-                Ok(song_info) => {
-                    if original_query != query {
-                        self.state.cache.remember_query(&original_query, &song_info.id).await;
-                    }
-                    let title = song_info.title.clone();
-                    let song_clone = song_info.clone();
-                    let position = {
-                        let mut queues = self.state.queues.lock().await;
-                        let queue = queues.entry(guild_id).or_insert_with(VecDeque::new);
-                        queue.push_back(song_info);
-                        queue.len()
-                    };
-
-                    if !self.state.is_active(guild_id).await {
-                        play_next_song(&ctx, &self.state, guild_id, msg.channel_id).await;
-                    } else {
-                        // Pre-download queued song into cache so it plays with 0 wait when its turn arrives
-                        prefetch_song_in_background(song_clone, self.state.cache.clone());
+                Ok(_) => {
+                    if !already_cached {
                         let _ = msg
                             .channel_id
                             .say(
                                 &ctx.http,
-                                format!("Added to queue (#{position}): `{title}`"),
+                                format!("Searching for `{query}`... (reserved #{position})"),
                             )
                             .await;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error during link lookup: {err:?}");
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, format!("Error: {err}"))
+                        .await;
+                    cancel_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket).await;
+                    return;
+                }
+            }
+
+            match extract_song_info(&self.state, &search_query).await {
+                Ok(song_info) => {
+                    if search_query != query {
+                        self.state.cache.remember_query(&query, &song_info.id).await;
+                    }
+                    let title = song_info.title.clone();
+                    match fill_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket, song_info)
+                        .await
+                    {
+                        FillResult::Queued(position) => {
+                            let _ = msg
+                                .channel_id
+                                .say(
+                                    &ctx.http,
+                                    format!("Added to queue (#{position}): `{title}`"),
+                                )
+                                .await;
+                        }
+                        FillResult::Started | FillResult::Cancelled => {}
                     }
                 }
                 Err(err) => {
@@ -305,27 +401,19 @@ impl EventHandler for Handler {
                         .channel_id
                         .say(&ctx.http, format!("Error: {err}"))
                         .await;
+                    cancel_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket).await;
                 }
             }
-        } else if content.starts_with("!!queue") {
-            let queue_list = {
+        } else if cmd == "!!queue" {
+            let (entries, total) = {
                 let queues = self.state.queues.lock().await;
-                queues.get(&guild_id).and_then(|q| {
-                    if q.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            q.iter()
-                                .enumerate()
-                                .map(|(i, song)| format!("{}. {}", i + 1, song.title))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )
-                    }
-                })
+                match queues.get(&guild_id) {
+                    Some(q) => (q.iter().map(|e| e.label()).collect::<Vec<_>>(), q.len()),
+                    None => (Vec::new(), 0),
+                }
             };
 
-            if let Some(queue_list) = queue_list {
+            if total > 0 {
                 let current = self
                     .state
                     .current_songs
@@ -335,25 +423,144 @@ impl EventHandler for Handler {
                     .map(|s| s.title.clone())
                     .unwrap_or_else(|| "Nothing".to_string());
 
+                // Stay under Discord's 2000 character message limit
+                let mut list = String::new();
+                let mut shown = 0;
+                for (i, label) in entries.iter().enumerate() {
+                    let line = format!("{}. {}\n", i + 1, label);
+                    if list.len() + line.len() > 1500 {
+                        break;
+                    }
+                    list.push_str(&line);
+                    shown += 1;
+                }
+                if shown < total {
+                    list.push_str(&format!("...and {} more", total - shown));
+                }
+
                 let _ = msg
                     .channel_id
                     .say(
                         &ctx.http,
-                        format!("**Now Playing:** `{current}`\n\n**Queue:**\n{queue_list}"),
+                        format!("**Now Playing:** `{current}`\n\n**Queue ({total}):**\n{list}"),
                     )
                     .await;
             } else {
                 let _ = msg.channel_id.say(&ctx.http, "Queue is empty!").await;
             }
-        } else if content.starts_with("!!skip") {
-            if self.state.is_active(guild_id).await {
-                let handle = {
-                    let tracks = self.state.current_tracks.lock().await;
-                    tracks.get(&guild_id).map(|t| t.handle.clone())
-                };
-                if let Some(handle) = handle {
-                    let _ = handle.stop(); // Triggers TrackEndNotifier -> play_next_song
+        } else if cmd == "!!remove" {
+            let arg = content.strip_prefix("!!remove").unwrap_or("").trim();
+            match arg.parse::<usize>() {
+                Ok(position) => match remove_from_queue(&self.state, guild_id, position).await {
+                    Some(entry) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("Removed `{}` from the queue.", entry.label()))
+                            .await;
+                    }
+                    None => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, "No song at that queue position.")
+                            .await;
+                    }
+                },
+                Err(_) => {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, "Usage: `!!remove <queue position>`")
+                        .await;
                 }
+            }
+        } else if cmd == "!!shuffle" {
+            let count = shuffle_queue(&self.state, guild_id).await;
+            let reply = if count > 1 {
+                format!("Shuffled {count} songs.")
+            } else {
+                "Not enough songs in the queue to shuffle.".to_string()
+            };
+            let _ = msg.channel_id.say(&ctx.http, reply).await;
+        } else if cmd == "!!nowplaying" || cmd == "!!np" {
+            let current = self.state.current_songs.lock().await.get(&guild_id).cloned();
+            let handle = {
+                let tracks = self.state.current_tracks.lock().await;
+                tracks.get(&guild_id).map(|t| t.handle.clone())
+            };
+            match (current, handle) {
+                (Some(song), Some(handle)) => {
+                    let elapsed = handle
+                        .get_info()
+                        .await
+                        .map(|i| i.position.as_secs())
+                        .unwrap_or(0);
+                    let _ = msg
+                        .channel_id
+                        .say(
+                            &ctx.http,
+                            format!(
+                                "**Now Playing:** `{}` ({}:{:02})\n{}",
+                                song.title,
+                                elapsed / 60,
+                                elapsed % 60,
+                                song.url
+                            ),
+                        )
+                        .await;
+                }
+                _ => {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, "Nothing is playing.")
+                        .await;
+                }
+            }
+        } else if cmd == "!!volume" {
+            let arg = content.strip_prefix("!!volume").unwrap_or("").trim();
+            if arg.is_empty() {
+                let volume = self
+                    .state
+                    .volumes
+                    .lock()
+                    .await
+                    .get(&guild_id)
+                    .copied()
+                    .unwrap_or(1.0);
+                let _ = msg
+                    .channel_id
+                    .say(
+                        &ctx.http,
+                        format!("Volume: `{:.0}%`. Usage: `!!volume <0-200>`", volume * 100.0),
+                    )
+                    .await;
+            } else if let Ok(percent) = arg.trim_end_matches('%').parse::<f32>() {
+                if (0.0..=200.0).contains(&percent) {
+                    let volume = percent / 100.0;
+                    self.state.volumes.lock().await.insert(guild_id, volume);
+                    let handle = {
+                        let tracks = self.state.current_tracks.lock().await;
+                        tracks.get(&guild_id).map(|t| t.handle.clone())
+                    };
+                    if let Some(handle) = handle {
+                        let _ = handle.set_volume(volume);
+                    }
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, format!("Volume set to `{percent:.0}%`."))
+                        .await;
+                } else {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, "Volume must be between 0 and 200.")
+                        .await;
+                }
+            } else {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "Usage: `!!volume <0-200>`")
+                    .await;
+            }
+        } else if cmd == "!!skip" {
+            if skip_current(&ctx, &self.state, guild_id, msg.channel_id).await {
                 let _ = msg
                     .channel_id
                     .say(&ctx.http, "Skipped to next song.")
@@ -361,17 +568,13 @@ impl EventHandler for Handler {
             } else {
                 let _ = msg.channel_id.say(&ctx.http, "Nothing to skip.").await;
             }
-        } else if content.starts_with("!!clear") {
-            let mut queues = self.state.queues.lock().await;
-            if let Some(queue) = queues.get_mut(&guild_id) {
-                queue.clear();
-                drop(queues);
+        } else if cmd == "!!clear" {
+            if clear_queue(&self.state, guild_id).await {
                 let _ = msg.channel_id.say(&ctx.http, "Queue cleared.").await;
             } else {
-                drop(queues);
                 let _ = msg.channel_id.say(&ctx.http, "No queue to clear.").await;
             }
-        } else if content.starts_with("!!pause") {
+        } else if cmd == "!!pause" {
             if self.state.is_playing(guild_id).await {
                 let handle = {
                     let tracks = self.state.current_tracks.lock().await;
@@ -390,7 +593,7 @@ impl EventHandler for Handler {
                     .say(&ctx.http, "No music is playing.")
                     .await;
             }
-        } else if content.starts_with("!!resume") {
+        } else if cmd == "!!resume" {
             if self.state.is_paused(guild_id).await {
                 let handle = {
                     let tracks = self.state.current_tracks.lock().await;
@@ -409,7 +612,7 @@ impl EventHandler for Handler {
                     .say(&ctx.http, "No music is paused.")
                     .await;
             }
-        } else if content.starts_with("!!loop") {
+        } else if cmd == "!!loop" {
             let enabled = {
                 let mut is_loop = self.state.is_loop.lock().await;
                 let current = is_loop.get(&guild_id).copied().unwrap_or(false);
@@ -422,19 +625,13 @@ impl EventHandler for Handler {
                 .channel_id
                 .say(&ctx.http, format!("Loop mode {status}"))
                 .await;
-        } else if content.starts_with("!!stop") {
+        } else if cmd == "!!stop" {
             let manager = songbird::get(&ctx)
                 .await
                 .expect("Songbird Voice client placed in at initialisation.");
 
             if manager.get(guild_id).is_some() {
-                if let Some(active) = self.state.current_tracks.lock().await.remove(&guild_id) {
-                    active.suppress_end.store(true, Ordering::SeqCst);
-                    let _ = active.handle.stop();
-                }
-                if let Some(queue) = self.state.queues.lock().await.get_mut(&guild_id) {
-                    queue.clear();
-                }
+                stop_playback(&self.state, guild_id).await;
                 let _ = msg
                     .channel_id
                     .say(&ctx.http, "Music stopped and queue cleared.")
@@ -448,7 +645,7 @@ impl EventHandler for Handler {
                     .await;
                 self.state.cancel_disconnect_timer(guild_id).await;
             }
-        } else if content == "!!stay" || content.starts_with("!!stay ") {
+        } else if cmd == "!!stay" {
             let arg = content.strip_prefix("!!stay").unwrap_or("").trim().to_lowercase();
 
             if arg.is_empty() {
@@ -490,12 +687,17 @@ impl EventHandler for Handler {
                         .and_then(|vs| vs.channel_id)
                 });
                 if let Some(connect_to) = user_channel_id {
-                    if let Err(err) = manager.join(guild_id, connect_to).await {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("Error joining voice channel: {err}"))
-                            .await;
-                        return;
+                    match manager.join(guild_id, connect_to).await {
+                        Ok(call) => {
+                            let _ = call.lock().await.deafen(true).await;
+                        }
+                        Err(err) => {
+                            let _ = msg
+                                .channel_id
+                                .say(&ctx.http, format!("Error joining voice channel: {err}"))
+                                .await;
+                            return;
+                        }
                     }
                 } else {
                     let _ = msg
@@ -575,7 +777,7 @@ impl EventHandler for Handler {
                     )
                     .await;
             }
-        } else if content.starts_with("!!disconnect") {
+        } else if cmd == "!!disconnect" {
             let manager = songbird::get(&ctx)
                 .await
                 .expect("Songbird Voice client placed in at initialisation.");
@@ -593,7 +795,7 @@ impl EventHandler for Handler {
                     .say(&ctx.http, "Not connected to any voice channel.")
                     .await;
             }
-        } else if content.starts_with("!!cache") {
+        } else if cmd == "!!cache" {
             self.state.cache.enforce_limits().await;
             let (count, bytes) = self.state.cache.stats().await;
             let mb = (bytes as f64) / (1024.0 * 1024.0);
@@ -604,7 +806,7 @@ impl EventHandler for Handler {
                     format!("Cached songs: `{count}` (`{mb:.2} MB` / `5120.00 MB`, TTL: 7 days)"),
                 )
                 .await;
-        } else if content.starts_with("!!help") {
+        } else if cmd == "!!help" {
             let help_text = "\
 ## **Offside BOT**
 ### **Playback**
@@ -614,8 +816,12 @@ impl EventHandler for Handler {
 • `!!skip` — Skip to the next song
 • `!!stop` — Stop playback and clear the queue
 • `!!loop` — Toggle loop mode for the current track
+• `!!nowplaying` (`!!np`) — Show the current song and elapsed time
+• `!!volume <0-200>` — Set playback volume
 ### **Queue**
 • `!!queue` — Show currently playing song and upcoming queue
+• `!!remove <n>` — Remove a song from the queue
+• `!!shuffle` — Shuffle the queue
 • `!!clear` — Clear all songs waiting in the queue
 ### **Voice Channel**
 • `!!stay <hours | forever | off>` — Set inactivity stay duration (e.g. `!!stay 24`, `!!stay forever`)

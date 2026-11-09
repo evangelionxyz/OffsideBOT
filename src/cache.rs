@@ -8,8 +8,9 @@ use tokio::sync::Mutex;
 
 use crate::models::{CacheEntry, CacheIndex, SongInfo};
 
-pub const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
-pub const MAX_CACHE_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GB
+// Server Storage = 100 GB
+pub const CACHE_TTL_SECS: u64 = 31 * 24 * 60 * 60; // 31 days
+pub const MAX_CACHE_BYTES: u64 = 35 * 1024 * 1024 * 1024; // 35 GB
 
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()

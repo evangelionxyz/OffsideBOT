@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{anyhow, Result};
 
@@ -13,7 +13,26 @@ pub struct SearchCandidate {
     pub url: String,
 }
 
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const SEARCH_ATTEMPTS: usize = 2;
+
+/// Runs yt-dlp with a timeout, retrying once on transient failures.
 pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate>> {
+    let mut last_err = anyhow!("search failed");
+    for attempt in 0..SEARCH_ATTEMPTS {
+        match tokio::time::timeout(SEARCH_TIMEOUT, fetch_search_candidates_once(target)).await {
+            Ok(Ok(candidates)) => return Ok(candidates),
+            Ok(Err(err)) => last_err = err,
+            Err(_) => last_err = anyhow!("Search timed out after {}s", SEARCH_TIMEOUT.as_secs()),
+        }
+        if attempt + 1 < SEARCH_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    Err(last_err)
+}
+
+async fn fetch_search_candidates_once(target: &str) -> Result<Vec<SearchCandidate>> {
     let mut cmd = tokio::process::Command::new(ytdl_program());
     cmd.args([
         "--flat-playlist",
@@ -26,7 +45,7 @@ pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate
     if Path::new("cookies.txt").exists() {
         cmd.args(["--cookies", "cookies.txt"]);
     }
-    cmd.arg(target);
+    cmd.arg(target).kill_on_drop(true);
 
     let output = cmd
         .output()

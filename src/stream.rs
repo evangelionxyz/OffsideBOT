@@ -1,10 +1,10 @@
 use std::{
-    collections::VecDeque,
-    fs::{self, File},
-    io::{Read, Write},
+    collections::HashSet,
+    fs,
+    io::Read,
     path::Path,
-    process::{Child, Command as StdCommand, Stdio},
-    sync::{Arc, Condvar, Mutex as StdMutex},
+    process::Stdio,
+    sync::{Arc, LazyLock, Mutex as StdMutex},
 };
 
 use anyhow::{anyhow, Result};
@@ -12,11 +12,41 @@ use songbird::input::{
     core::io::{MediaSource, ReadOnlySource},
     AudioStream, Input, LiveInput,
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    sync::mpsc,
+};
 
 use crate::{
     cache::{now_unix_secs, SongCache, MAX_CACHE_BYTES},
     models::SongInfo,
 };
+
+/// Song IDs currently being downloaded, so the prefetcher and the live stream never
+/// write the same cache file at the same time.
+static INFLIGHT: LazyLock<StdMutex<HashSet<String>>> =
+    LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+pub struct InflightGuard(String);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = INFLIGHT.lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Returns a guard if no other download for this song is running.
+pub fn try_begin_download(id: &str) -> Option<InflightGuard> {
+    let mut set = INFLIGHT.lock().ok()?;
+    if set.insert(id.to_string()) {
+        Some(InflightGuard(id.to_string()))
+    } else {
+        None
+    }
+}
 
 pub fn ytdl_program() -> &'static str {
     if Path::new("yt-dlp.exe").exists() {
@@ -27,7 +57,7 @@ pub fn ytdl_program() -> &'static str {
 }
 
 pub fn spawn_ytdl_child(url: &str) -> Result<Child> {
-    let mut cmd = StdCommand::new(ytdl_program());
+    let mut cmd = Command::new(ytdl_program());
     cmd.args([
         "-o",
         "-",
@@ -44,59 +74,42 @@ pub fn spawn_ytdl_child(url: &str) -> Result<Child> {
     cmd.arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
 
     cmd.spawn()
         .map_err(|e| anyhow!("Failed to spawn yt-dlp: {e}"))
 }
 
-struct SharedTeeBuffer {
-    buf: VecDeque<u8>,
-    eof: bool,
-    error: Option<String>,
-    reader_dropped: bool,
+/// Sync `Read` adapter over a bounded channel, consumed by Songbird's audio thread.
+struct ChannelReader {
+    rx: mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
+    current: Vec<u8>,
+    pos: usize,
 }
 
-struct TeeStreamReader {
-    shared: Arc<(StdMutex<SharedTeeBuffer>, Condvar)>,
-}
-
-impl Read for TeeStreamReader {
+impl Read for ChannelReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let (lock, cvar) = &*self.shared;
-        let mut guard = lock.lock().unwrap();
-        loop {
-            if !guard.buf.is_empty() {
-                let n = out.len().min(guard.buf.len());
-                for b in out.iter_mut().take(n) {
-                    *b = guard.buf.pop_front().unwrap();
+        while self.pos >= self.current.len() {
+            match self.rx.blocking_recv() {
+                Some(Ok(chunk)) => {
+                    self.current = chunk;
+                    self.pos = 0;
                 }
-                return Ok(n);
+                Some(Err(err)) => return Err(std::io::Error::other(err)),
+                None => return Ok(0),
             }
-            if let Some(ref err) = guard.error {
-                return Err(std::io::Error::other(err.clone()));
-            }
-            if guard.eof {
-                return Ok(0);
-            }
-            guard = cvar.wait(guard).unwrap();
         }
-    }
-}
-
-impl Drop for TeeStreamReader {
-    fn drop(&mut self) {
-        let (lock, cvar) = &*self.shared;
-        if let Ok(mut guard) = lock.lock() {
-            guard.reader_dropped = true;
-            guard.buf.clear();
-            cvar.notify_all();
-        }
+        let n = out.len().min(self.current.len() - self.pos);
+        out[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
     }
 }
 
 /// Streams audio from `yt-dlp` into Songbird immediately while simultaneously
 /// saving the complete audio stream into the disk cache (`cache/<id>.audio`).
+/// Must be called from within a Tokio runtime.
 pub fn spawn_tee_cached_stream(song: SongInfo, cache: Arc<SongCache>) -> Result<Input> {
     let mut child = spawn_ytdl_child(&song.url)?;
     let mut stdout = child
@@ -110,84 +123,78 @@ pub fn spawn_tee_cached_stream(song: SongInfo, cache: Arc<SongCache>) -> Result<
     let part_path = cache.file_path(&part_file_name);
     let final_path = cache.file_path(&final_file_name);
 
-    let shared = Arc::new((
-        StdMutex::new(SharedTeeBuffer {
-            buf: VecDeque::with_capacity(64 * 1024),
-            eof: false,
-            error: None,
-            reader_dropped: false,
-        }),
-        Condvar::new(),
-    ));
+    // If someone else is already caching this song, stream live without writing the cache.
+    let guard = try_begin_download(&song.id);
 
-    let shared_writer = shared.clone();
-    let rt_handle = tokio::runtime::Handle::current();
+    let (tx, rx) = mpsc::channel::<std::result::Result<Vec<u8>, String>>(32);
 
-    std::thread::spawn(move || {
-        let mut part_file = File::create(&part_path).ok();
-        let mut chunk = [0u8; 32 * 1024];
+    tokio::spawn(async move {
+        let _guard = guard;
+        let mut part_file = if _guard.is_some() {
+            tokio::fs::File::create(&part_path).await.ok()
+        } else {
+            None
+        };
+        let mut chunk = vec![0u8; 32 * 1024];
         let mut total_written: u64 = 0;
         let mut download_complete = false;
+        let mut listener_alive = true;
 
         loop {
-            match stdout.read(&mut chunk) {
+            match stdout.read(&mut chunk).await {
                 Ok(0) => {
                     download_complete = true;
                     break;
                 }
                 Ok(n) => {
-                    if let Some(ref mut f) = part_file {
-                        if total_written + (n as u64) <= MAX_CACHE_BYTES {
-                            if f.write_all(&chunk[..n]).is_err() {
-                                part_file = None;
-                            } else {
-                                total_written += n as u64;
-                            }
+                    if let Some(f) = part_file.as_mut() {
+                        if total_written + (n as u64) <= MAX_CACHE_BYTES
+                            && f.write_all(&chunk[..n]).await.is_ok()
+                        {
+                            total_written += n as u64;
                         } else {
                             part_file = None;
                         }
                     }
-
-                    let (lock, cvar) = &*shared_writer;
-                    let mut guard = lock.lock().unwrap();
-                    if !guard.reader_dropped {
-                        guard.buf.extend(&chunk[..n]);
-                        cvar.notify_all();
+                    if listener_alive && tx.send(Ok(chunk[..n].to_vec())).await.is_err() {
+                        listener_alive = false;
+                    }
+                    // Nobody is listening and nothing is being cached: stop downloading.
+                    if !listener_alive && part_file.is_none() {
+                        break;
                     }
                 }
                 Err(e) => {
-                    let (lock, cvar) = &*shared_writer;
-                    let mut guard = lock.lock().unwrap();
-                    guard.error = Some(e.to_string());
-                    cvar.notify_all();
+                    let _ = tx.send(Err(e.to_string())).await;
                     break;
                 }
             }
         }
+        drop(tx);
 
-        let status_ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        {
-            let (lock, cvar) = &*shared_writer;
-            let mut guard = lock.lock().unwrap();
-            guard.eof = true;
-            cvar.notify_all();
+        if !download_complete {
+            let _ = child.kill().await;
         }
+        let status_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
 
-        drop(part_file);
+        if let Some(mut f) = part_file.take() {
+            let _ = f.flush().await;
+        }
 
         if download_complete && status_ok && total_written > 0 {
             if fs::rename(&part_path, &final_path).is_ok() {
-                rt_handle.spawn(async move {
-                    cache.insert_cached_file(&song, None, final_file_name).await;
-                });
+                cache.insert_cached_file(&song, None, final_file_name).await;
                 return;
             }
         }
-
         let _ = fs::remove_file(&part_path);
     });
 
-    let reader = TeeStreamReader { shared };
+    let reader = ChannelReader {
+        rx,
+        current: Vec::new(),
+        pos: 0,
+    };
     let audio_stream = AudioStream {
         input: Box::new(ReadOnlySource::new(reader)) as Box<dyn MediaSource>,
     };
@@ -200,6 +207,9 @@ pub fn prefetch_song_in_background(song: SongInfo, cache: Arc<SongCache>) {
         if cache.get_cached_path(&song.id).await.is_some() {
             return;
         }
+        let Some(_guard) = try_begin_download(&song.id) else {
+            return;
+        };
 
         let safe_id = SongCache::sanitize_id(&song.id);
         let final_file_name = format!("{safe_id}.audio");
@@ -207,7 +217,7 @@ pub fn prefetch_song_in_background(song: SongInfo, cache: Arc<SongCache>) {
         let part_path = cache.file_path(&part_file_name);
         let final_path = cache.file_path(&final_file_name);
 
-        let mut cmd = tokio::process::Command::new(ytdl_program());
+        let mut cmd = Command::new(ytdl_program());
         cmd.args([
             "-q",
             "--no-warnings",
@@ -224,7 +234,8 @@ pub fn prefetch_song_in_background(song: SongInfo, cache: Arc<SongCache>) {
         cmd.arg(&song.url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
         if let Ok(status) = cmd.status().await {
             if status.success() && part_path.exists() {
@@ -237,4 +248,3 @@ pub fn prefetch_song_in_background(song: SongInfo, cache: Arc<SongCache>) {
         let _ = fs::remove_file(&part_path);
     });
 }
-
