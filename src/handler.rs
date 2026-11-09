@@ -1059,7 +1059,7 @@ impl EventHandler for Handler {
                 .channel_id
                 .say(
                     &ctx.http,
-                    format!("Cached songs: `{count}` (`{mb:.2} MB` / `5120.00 MB`, TTL: 7 days)"),
+                    format!("Cached songs: `{count}` (`{mb:.2} MB` / `35,840.00 MB`, TTL: 31 days)"),
                 )
                 .await;
         } else if cmd == "!!help" {
@@ -1067,6 +1067,7 @@ impl EventHandler for Handler {
 ## **Offside BOT**
 ### **Playback**
 • `!!play <song | URL>` — Play a song or add to queue (YouTube, Spotify, Apple Music, Deezer)
+• `!!playlist <URL> [loop]` — Play album or playlist, can use `loop`
 • `!!pause` — Pause current playback
 • `!!resume` — Resume playback
 • `!!skip` — Skip to the next song
