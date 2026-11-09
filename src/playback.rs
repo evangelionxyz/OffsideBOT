@@ -22,7 +22,7 @@ use songbird::{
 };
 
 use crate::{
-    models::{ActiveTrack, QueueEntry, SongInfo, StayMode},
+    models::{ActiveTrack, LoopMode, QueueEntry, SongInfo, StayMode},
     state::BotState,
     stream::{prefetch_song_in_background, spawn_tee_cached_stream},
 };
@@ -289,7 +289,10 @@ pub async fn fill_slot(
         FillResult::Started
     } else {
         // Download in the background so it starts instantly when its turn comes
-        prefetch_song_in_background(song, state.cache.clone());
+        // (only for the next few songs, so big playlists don't spawn dozens of downloads)
+        if position <= 3 {
+            prefetch_song_in_background(song, state.cache.clone());
+        }
         FillResult::Queued(position)
     }
 }
@@ -469,6 +472,31 @@ async fn play_next_locked(
             continue;
         }
 
+        // Playlist loop: put the song back at the end of the queue as it starts
+        let loop_queue = state
+            .loop_modes
+            .lock()
+            .await
+            .get(&guild_id)
+            .copied()
+            .unwrap_or_default()
+            == LoopMode::Queue;
+        {
+            let mut queues = state.queues.lock().await;
+            let queue = queues.entry(guild_id).or_default();
+            if loop_queue {
+                queue.push_back(QueueEntry {
+                    ticket: state.next_ticket.fetch_add(1, Ordering::SeqCst),
+                    query: next_song.title.clone(),
+                    song: Some(next_song.clone()),
+                });
+            }
+            // Warm the cache for whatever plays next
+            if let Some(upcoming) = queue.front().and_then(|e| e.song.clone()) {
+                prefetch_song_in_background(upcoming, state.cache.clone());
+            }
+        }
+
         let _ = channel_id
             .say(&ctx.http, format!("Now playing: `{}`", next_song.title))
             .await;
@@ -476,12 +504,13 @@ async fn play_next_locked(
     }
 
     let should_loop = state
-        .is_loop
+        .loop_modes
         .lock()
         .await
         .get(&guild_id)
         .copied()
-        .unwrap_or(false);
+        .unwrap_or_default()
+        == LoopMode::Track;
     let current_song = state.current_songs.lock().await.get(&guild_id).cloned();
 
     if should_loop {
@@ -507,4 +536,80 @@ async fn play_next_locked(
         .say(&ctx.http, "No more songs in the queue.")
         .await;
     start_disconnect_timer(ctx.clone(), state.clone(), guild_id, channel_id);
+}
+
+/// Queues many resolved songs at once (playlists). Returns how many were added.
+pub async fn enqueue_songs(
+    ctx: &Context,
+    state: &Arc<BotState>,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    songs: Vec<SongInfo>,
+) -> usize {
+    let lock = state.guild_lock(guild_id).await;
+    let _guard = lock.lock().await;
+
+    let added = {
+        let mut queues = state.queues.lock().await;
+        let queue = queues.entry(guild_id).or_default();
+        let room = MAX_QUEUE_LEN.saturating_sub(queue.len());
+        let mut added = 0;
+        for song in songs.into_iter().take(room) {
+            queue.push_back(QueueEntry {
+                ticket: state.next_ticket.fetch_add(1, Ordering::SeqCst),
+                query: song.title.clone(),
+                song: Some(song),
+            });
+            added += 1;
+        }
+        added
+    };
+    if added == 0 {
+        return 0;
+    }
+
+    state.cancel_disconnect_timer(guild_id).await;
+    let idle = !state.current_tracks.lock().await.contains_key(&guild_id);
+    if idle {
+        play_next_locked(ctx, state, guild_id, channel_id).await;
+    }
+    added
+}
+
+/// Reserves one pending slot per query (playlist import). Returns the tickets that fit.
+pub async fn reserve_slots(
+    state: &Arc<BotState>,
+    guild_id: GuildId,
+    queries: &[String],
+) -> Vec<u64> {
+    let lock = state.guild_lock(guild_id).await;
+    let _guard = lock.lock().await;
+
+    let mut queues = state.queues.lock().await;
+    let queue = queues.entry(guild_id).or_default();
+    let room = MAX_QUEUE_LEN.saturating_sub(queue.len());
+    let mut tickets = Vec::new();
+    for query in queries.iter().take(room) {
+        let ticket = state.next_ticket.fetch_add(1, Ordering::SeqCst);
+        queue.push_back(QueueEntry {
+            ticket,
+            query: query.clone(),
+            song: None,
+        });
+        tickets.push(ticket);
+    }
+    drop(queues);
+
+    state.cancel_disconnect_timer(guild_id).await;
+    tickets
+}
+
+/// True while the reserved slot is still waiting in the queue (not cleared or removed).
+pub async fn slot_exists(state: &Arc<BotState>, guild_id: GuildId, ticket: u64) -> bool {
+    state
+        .queues
+        .lock()
+        .await
+        .get(&guild_id)
+        .is_some_and(|q| q.iter().any(|e| e.ticket == ticket))
 }

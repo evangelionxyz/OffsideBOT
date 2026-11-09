@@ -3,25 +3,31 @@ use std::{
     time::Duration,
 };
 
+use tokio::sync::Semaphore;
+
 use serenity::{
     async_trait,
     client::{Context, EventHandler},
     model::{
         channel::Message,
         gateway::Ready,
-        id::{GuildId, UserId},
+        id::{ChannelId, GuildId, UserId},
         voice::VoiceState,
     },
 };
 
 use crate::{
-    models::StayMode,
+    models::{LoopMode, StayMode},
     playback::{
-        cancel_slot, clear_queue, fill_slot, remove_from_queue, reserve_slot, shuffle_queue,
+        cancel_slot, clear_queue, enqueue_songs, fill_slot, reserve_slots, slot_exists, MAX_QUEUE_LEN, remove_from_queue, reserve_slot, shuffle_queue,
         skip_current, start_disconnect_timer, stop_playback, FillResult,
     },
-    resolvers::{fetch_apple_music_track, fetch_deezer_track, fetch_spotify_track},
-    search::extract_song_info,
+    resolvers::{
+        fetch_apple_music_track, fetch_deezer_track, fetch_spotify_collection, fetch_spotify_track,
+        parse_spotify_collection_url,
+    },
+    models::SongInfo,
+    search::{extract_song_info, fetch_playlist_candidates},
     state::BotState,
 };
 
@@ -29,6 +35,114 @@ pub struct Handler {
     pub state: Arc<BotState>,
 }
 
+/// Queues every track of a Spotify playlist/album: slots are reserved immediately in order,
+/// then each track is matched on YouTube in the background (3 at a time).
+async fn queue_spotify_collection(
+    ctx: &Context,
+    state: &Arc<BotState>,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    kind: &'static str,
+    id: &str,
+    wants_loop: bool,
+) {
+    let _ = channel_id
+        .say(&ctx.http, format!("Loading Spotify {kind}..."))
+        .await;
+
+    let (name, tracks) = match fetch_spotify_collection(&state.http_client, kind, id).await {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("Error loading Spotify {kind}: {err:?}");
+            let _ = channel_id.say(&ctx.http, format!("Error: {err}")).await;
+            return;
+        }
+    };
+
+    let queries: Vec<String> = tracks
+        .iter()
+        .map(|(title, artist)| {
+            if artist.is_empty() {
+                title.clone()
+            } else {
+                format!("{artist} - {title}")
+            }
+        })
+        .collect();
+    let total = queries.len();
+
+    let tickets = reserve_slots(state, guild_id, &queries).await;
+    if tickets.is_empty() {
+        let _ = channel_id
+            .say(&ctx.http, format!("Queue is full (max {MAX_QUEUE_LEN} songs)."))
+            .await;
+        return;
+    }
+
+    if wants_loop {
+        state
+            .loop_modes
+            .lock()
+            .await
+            .insert(guild_id, LoopMode::Queue);
+    }
+
+    let queued = tickets.len();
+    let mut reply = format!(
+        "Queued {queued} of {total} tracks from Spotify {kind} `{name}`. Finding them on YouTube..."
+    );
+    if wants_loop {
+        reply.push_str(" Queue loop is on (`!!loop off` to stop).");
+    }
+    let _ = channel_id.say(&ctx.http, reply).await;
+
+    let ctx = ctx.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let semaphore = Arc::new(Semaphore::new(3));
+        let mut jobs = Vec::new();
+        for (ticket, query) in tickets.into_iter().zip(queries) {
+            // The semaphore hands out permits in order, so earlier tracks resolve first
+            let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                break;
+            };
+            let ctx = ctx.clone();
+            let state = state.clone();
+            jobs.push(tokio::spawn(async move {
+                let _permit = permit;
+                if !slot_exists(&state, guild_id, ticket).await {
+                    return true; // cleared by the user, not a failure
+                }
+                match extract_song_info(&state, &query).await {
+                    Ok(song) => {
+                        fill_slot(&ctx, &state, guild_id, channel_id, ticket, song).await;
+                        true
+                    }
+                    Err(err) => {
+                        eprintln!("Spotify track not found on YouTube ({query}): {err:?}");
+                        cancel_slot(&ctx, &state, guild_id, channel_id, ticket).await;
+                        false
+                    }
+                }
+            }));
+        }
+
+        let mut failed = 0;
+        for job in jobs {
+            if matches!(job.await, Ok(false)) {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            let _ = channel_id
+                .say(
+                    &ctx.http,
+                    format!("Could not find {failed} track(s) from the Spotify {kind} on YouTube."),
+                )
+                .await;
+        }
+    });
+}
 /// Counts non-bot members in a voice channel using the gateway cache.
 fn humans_in_channel(
     ctx: &Context,
@@ -255,7 +369,7 @@ impl EventHandler for Handler {
 
         // Playback controls only work for users sitting in the bot's voice channel
         const CHANNEL_GATED: &[&str] = &[
-            "!!play", "!!skip", "!!stop", "!!pause", "!!resume", "!!loop", "!!clear", "!!remove",
+            "!!play", "!!playlist", "!!skip", "!!stop", "!!pause", "!!resume", "!!loop", "!!clear", "!!remove",
             "!!shuffle", "!!volume", "!!stay", "!!disconnect",
         ];
         if CHANNEL_GATED.contains(&cmd) && !in_bot_channel(&ctx, guild_id, msg.author.id).await {
@@ -296,9 +410,12 @@ impl EventHandler for Handler {
                 return;
             }
 
-            {
-                let mut is_loop = self.state.is_loop.lock().await;
-                is_loop.entry(guild_id).or_insert(false);
+            if parse_spotify_collection_url(&query).is_some() {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "That is a Spotify playlist/album. Use `!!playlist <url>` instead.")
+                    .await;
+                return;
             }
 
             let manager = songbird::get(&ctx)
@@ -404,7 +521,126 @@ impl EventHandler for Handler {
                     cancel_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket).await;
                 }
             }
-        } else if cmd == "!!queue" {
+        } else if cmd == "!!playlist" {
+            let mut args = content.split_whitespace().skip(1);
+            let url = args.next().unwrap_or("").to_string();
+            let wants_loop = args.any(|a| a.eq_ignore_ascii_case("loop"));
+
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "Usage: `!!playlist <playlist URL> [loop]`")
+                    .await;
+                return;
+            }
+
+            let user_channel_id = ctx.cache.guild(guild_id).and_then(|guild| {
+                guild
+                    .voice_states
+                    .get(&msg.author.id)
+                    .and_then(|vs| vs.channel_id)
+            });
+            let Some(connect_to) = user_channel_id else {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "You need to be in a voice channel!")
+                    .await;
+                return;
+            };
+
+            let manager = songbird::get(&ctx)
+                .await
+                .expect("Songbird Voice client placed in at initialisation.");
+            if manager.get(guild_id).is_none() {
+                match manager.join(guild_id, connect_to).await {
+                    Ok(call) => {
+                        let _ = call.lock().await.deafen(true).await;
+                    }
+                    Err(err) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("Error: {err}"))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            if let Some((kind, id)) = parse_spotify_collection_url(&url) {
+                queue_spotify_collection(
+                    &ctx,
+                    &self.state,
+                    guild_id,
+                    msg.channel_id,
+                    kind,
+                    &id,
+                    wants_loop,
+                )
+                .await;
+                return;
+            }
+
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, "Loading playlist...")
+                .await;
+
+            let candidates = match fetch_playlist_candidates(&url, MAX_QUEUE_LEN).await {
+                Ok(list) => list,
+                Err(err) => {
+                    eprintln!("Error loading playlist: {err:?}");
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, format!("Error: {err}"))
+                        .await;
+                    return;
+                }
+            };
+
+            // Skip private/deleted placeholders such as "[Private video]"
+            let songs: Vec<SongInfo> = candidates
+                .into_iter()
+                .filter(|c| !c.title.starts_with('['))
+                .map(|c| {
+                    let url = if c.url.starts_with("http://") || c.url.starts_with("https://") {
+                        c.url
+                    } else {
+                        format!("https://www.youtube.com/watch?v={}", c.id)
+                    };
+                    SongInfo {
+                        id: c.id,
+                        url,
+                        title: c.title,
+                    }
+                })
+                .collect();
+
+            if songs.is_empty() {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "No playable songs found in that playlist.")
+                    .await;
+                return;
+            }
+
+            if wants_loop {
+                self.state
+                    .loop_modes
+                    .lock()
+                    .await
+                    .insert(guild_id, LoopMode::Queue);
+            }
+
+            let total = songs.len();
+            let added = enqueue_songs(&ctx, &self.state, guild_id, msg.channel_id, songs).await;
+            let mut reply = format!("Added {added} of {total} playlist songs to the queue.");
+            if added < total {
+                reply.push_str(&format!(" (Queue limit is {MAX_QUEUE_LEN}.)"));
+            }
+            if wants_loop {
+                reply.push_str(" Queue loop is on (`!!loop off` to stop).");
+            }
+            let _ = msg.channel_id.say(&ctx.http, reply).await;        } else if cmd == "!!queue" {
             let (entries, total) = {
                 let queues = self.state.queues.lock().await;
                 match queues.get(&guild_id) {
@@ -613,17 +849,37 @@ impl EventHandler for Handler {
                     .await;
             }
         } else if cmd == "!!loop" {
-            let enabled = {
-                let mut is_loop = self.state.is_loop.lock().await;
-                let current = is_loop.get(&guild_id).copied().unwrap_or(false);
-                let next = !current;
-                is_loop.insert(guild_id, next);
-                next
+            let arg = content.strip_prefix("!!loop").unwrap_or("").trim().to_lowercase();
+            let mut modes = self.state.loop_modes.lock().await;
+            let current = modes.get(&guild_id).copied().unwrap_or_default();
+            let next = match arg.as_str() {
+                "" => match current {
+                    LoopMode::Off => LoopMode::Track,
+                    LoopMode::Track => LoopMode::Queue,
+                    LoopMode::Queue => LoopMode::Off,
+                },
+                "off" => LoopMode::Off,
+                "track" | "song" | "one" => LoopMode::Track,
+                "queue" | "playlist" | "all" => LoopMode::Queue,
+                _ => {
+                    drop(modes);
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, "Usage: `!!loop [off | track | queue]`")
+                        .await;
+                    return;
+                }
             };
-            let status = if enabled { "enabled" } else { "disabled" };
+            modes.insert(guild_id, next);
+            drop(modes);
+            let status = match next {
+                LoopMode::Off => "off",
+                LoopMode::Track => "track (repeats the last song when the queue ends)",
+                LoopMode::Queue => "queue (the whole queue/playlist repeats)",
+            };
             let _ = msg
                 .channel_id
-                .say(&ctx.http, format!("Loop mode {status}"))
+                .say(&ctx.http, format!("Loop mode: {status}"))
                 .await;
         } else if cmd == "!!stop" {
             let manager = songbird::get(&ctx)
@@ -815,7 +1071,7 @@ impl EventHandler for Handler {
 • `!!resume` — Resume playback
 • `!!skip` — Skip to the next song
 • `!!stop` — Stop playback and clear the queue
-• `!!loop` — Toggle loop mode for the current track
+• `!!loop <track | queue | off>` — Toggle loop mode for the current track / playlist(queue) or off
 • `!!nowplaying` (`!!np`) — Show the current song and elapsed time
 • `!!volume <0-200>` — Set playback volume
 ### **Queue**

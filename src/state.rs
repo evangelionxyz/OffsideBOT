@@ -14,12 +14,12 @@ use tokio::{sync::Mutex, task::AbortHandle};
 
 use crate::{
     cache::SongCache,
-    models::{ActiveTrack, QueueEntry, SongInfo, StayMode},
+    models::{ActiveTrack, LoopMode, QueueEntry, SongInfo, StayMode},
 };
 
 pub struct BotState {
     pub queues: Mutex<HashMap<GuildId, VecDeque<QueueEntry>>>,
-    pub is_loop: Mutex<HashMap<GuildId, bool>>,
+    pub loop_modes: Mutex<HashMap<GuildId, LoopMode>>,
     pub stay_modes: Mutex<HashMap<GuildId, StayMode>>,
     pub current_songs: Mutex<HashMap<GuildId, SongInfo>>,
     pub current_tracks: Mutex<HashMap<GuildId, ActiveTrack>>,
@@ -43,7 +43,7 @@ impl BotState {
         let cache_dir = env::var("CACHE_DIR").unwrap_or_else(|_| "cache".to_string());
         Self {
             queues: Mutex::new(HashMap::new()),
-            is_loop: Mutex::new(HashMap::new()),
+            loop_modes: Mutex::new(HashMap::new()),
             stay_modes: Mutex::new(HashMap::new()),
             current_songs: Mutex::new(HashMap::new()),
             current_tracks: Mutex::new(HashMap::new()),
@@ -101,7 +101,7 @@ impl BotState {
         }
         self.queues.lock().await.remove(&guild_id);
         self.current_songs.lock().await.remove(&guild_id);
-        self.is_loop.lock().await.remove(&guild_id);
+        self.loop_modes.lock().await.remove(&guild_id);
         self.stay_modes.lock().await.remove(&guild_id);
         self.volumes.lock().await.remove(&guild_id);
         self.play_locks.lock().await.remove(&guild_id);

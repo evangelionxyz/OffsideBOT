@@ -61,3 +61,13 @@ pub enum StayMode {
     Forever,
 }
 
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopMode {
+    #[default]
+    Off,
+    /// Repeat the last song once the queue runs out
+    Track,
+    /// Re-append every song to the back of the queue after it starts (playlist loop)
+    Queue,
+}

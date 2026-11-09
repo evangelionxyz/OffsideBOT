@@ -335,3 +335,75 @@ mod tests {
         assert_eq!(artist, "Rick Astley");
     }
 }
+
+/// Extracts `(kind, id)` from a Spotify playlist or album URL.
+pub fn parse_spotify_collection_url(url: &str) -> Option<(&'static str, String)> {
+    let re = Regex::new(r"open\.spotify\.com/(?:intl-[a-zA-Z-]+/)?(playlist|album)/([a-zA-Z0-9]+)").ok()?;
+    let caps = re.captures(url)?;
+    let kind = if &caps[1] == "playlist" { "playlist" } else { "album" };
+    Some((kind, caps[2].to_string()))
+}
+
+/// Zero-API-key resolver for Spotify playlists and albums. Reads the public embed page,
+/// which lists the tracks (title, artist) without needing credentials or DRM-protected audio.
+/// Returns `(collection name, [(title, artist)])`.
+pub async fn fetch_spotify_collection(
+    http_client: &reqwest::Client,
+    kind: &str,
+    id: &str,
+) -> Result<(String, Vec<(String, String)>)> {
+    let html = http_client
+        .get(format!("https://open.spotify.com/embed/{kind}/{id}"))
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| anyhow!("Spotify {kind} not found or not public: {e}"))?
+        .text()
+        .await?;
+
+    let re = Regex::new(r#"(?s)<script id="__NEXT_DATA__" type="application/json">(.*?)</script>"#)
+        .map_err(|e| anyhow!("{e}"))?;
+    let json_text = re
+        .captures(&html)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+        .ok_or_else(|| anyhow!("Could not read the Spotify {kind} page"))?;
+    let json: serde_json::Value = serde_json::from_str(json_text)?;
+
+    let entity = json
+        .pointer("/props/pageProps/state/data/entity")
+        .ok_or_else(|| anyhow!("Spotify {kind} data missing"))?;
+    let name = entity
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(kind)
+        .to_string();
+
+    let tracks: Vec<(String, String)> = entity
+        .get("trackList")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter(|t| t.get("isPlayable").and_then(|p| p.as_bool()).unwrap_or(true))
+                .filter_map(|t| {
+                    let title = t.get("title")?.as_str()?.trim();
+                    let artist = t.get("subtitle").and_then(|s| s.as_str()).unwrap_or("").trim();
+                    if title.is_empty() {
+                        return None;
+                    }
+                    Some((decode_html_entities(title), decode_html_entities(artist)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if tracks.is_empty() {
+        return Err(anyhow!("No tracks found in that Spotify {kind}"));
+    }
+    Ok((decode_html_entities(&name), tracks))
+}

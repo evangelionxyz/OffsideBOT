@@ -18,12 +18,24 @@ const SEARCH_ATTEMPTS: usize = 2;
 
 /// Runs yt-dlp with a timeout, retrying once on transient failures.
 pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate>> {
+    fetch_candidates_with_retry(target, false).await
+}
+
+/// Lists the entries of a playlist URL (flat, no per-video lookups), capped at `max_items`.
+pub async fn fetch_playlist_candidates(url: &str, max_items: usize) -> Result<Vec<SearchCandidate>> {
+    let mut list = fetch_candidates_with_retry(url, true).await?;
+    list.truncate(max_items);
+    Ok(list)
+}
+
+async fn fetch_candidates_with_retry(target: &str, playlist: bool) -> Result<Vec<SearchCandidate>> {
+    let timeout = if playlist { SEARCH_TIMEOUT * 3 } else { SEARCH_TIMEOUT };
     let mut last_err = anyhow!("search failed");
     for attempt in 0..SEARCH_ATTEMPTS {
-        match tokio::time::timeout(SEARCH_TIMEOUT, fetch_search_candidates_once(target)).await {
+        match tokio::time::timeout(timeout, fetch_search_candidates_once(target, playlist)).await {
             Ok(Ok(candidates)) => return Ok(candidates),
             Ok(Err(err)) => last_err = err,
-            Err(_) => last_err = anyhow!("Search timed out after {}s", SEARCH_TIMEOUT.as_secs()),
+            Err(_) => last_err = anyhow!("Search timed out after {}s", timeout.as_secs()),
         }
         if attempt + 1 < SEARCH_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -32,15 +44,15 @@ pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate
     Err(last_err)
 }
 
-async fn fetch_search_candidates_once(target: &str) -> Result<Vec<SearchCandidate>> {
+async fn fetch_search_candidates_once(target: &str, playlist: bool) -> Result<Vec<SearchCandidate>> {
     let mut cmd = tokio::process::Command::new(ytdl_program());
     cmd.args([
         "--flat-playlist",
         "--print",
         "%(id)s\t%(title)s\t%(channel,uploader)s\t%(duration)s\t%(webpage_url,url)s",
-        "--no-playlist",
         "--no-warnings",
         "--no-check-certificate",
+        if playlist { "--yes-playlist" } else { "--no-playlist" },
     ]);
     if Path::new("cookies.txt").exists() {
         cmd.args(["--cookies", "cookies.txt"]);
