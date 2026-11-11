@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ impl QueueEntry {
     pub fn label(&self) -> String {
         match &self.song {
             Some(song) => song.title.clone(),
-            None => format!("⏳ Searching: {}", self.query),
+            None => format!("⏳ {}", self.query),
         }
     }
 }
@@ -60,7 +60,6 @@ pub enum StayMode {
     Hours(f64),
     Forever,
 }
-
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoopMode {
