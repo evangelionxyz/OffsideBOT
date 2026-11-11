@@ -1,6 +1,6 @@
 use std::{path::Path, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::{models::SongInfo, state::BotState, stream::ytdl_program};
 
@@ -16,20 +16,32 @@ pub struct SearchCandidate {
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SEARCH_ATTEMPTS: usize = 2;
 
+static YTDL_LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Runs yt-dlp with a timeout, retrying once on transient failures.
 pub async fn fetch_search_candidates(target: &str) -> Result<Vec<SearchCandidate>> {
-    fetch_candidates_with_retry(target, false).await
+    fetch_candidates_with_retry(target, None).await
 }
 
 /// Lists the entries of a playlist URL (flat, no per-video lookups), capped at `max_items`.
-pub async fn fetch_playlist_candidates(url: &str, max_items: usize) -> Result<Vec<SearchCandidate>> {
-    let mut list = fetch_candidates_with_retry(url, true).await?;
+pub async fn fetch_playlist_candidates(
+    url: &str,
+    max_items: usize,
+) -> Result<Vec<SearchCandidate>> {
+    let mut list = fetch_candidates_with_retry(url, Some(max_items)).await?;
     list.truncate(max_items);
     Ok(list)
 }
 
-async fn fetch_candidates_with_retry(target: &str, playlist: bool) -> Result<Vec<SearchCandidate>> {
-    let timeout = if playlist { SEARCH_TIMEOUT * 3 } else { SEARCH_TIMEOUT };
+async fn fetch_candidates_with_retry(
+    target: &str,
+    playlist: Option<usize>,
+) -> Result<Vec<SearchCandidate>> {
+    let timeout = if playlist.is_some() {
+        SEARCH_TIMEOUT * 3
+    } else {
+        SEARCH_TIMEOUT
+    };
     let mut last_err = anyhow!("search failed");
     for attempt in 0..SEARCH_ATTEMPTS {
         match tokio::time::timeout(timeout, fetch_search_candidates_once(target, playlist)).await {
@@ -44,7 +56,12 @@ async fn fetch_candidates_with_retry(target: &str, playlist: bool) -> Result<Vec
     Err(last_err)
 }
 
-async fn fetch_search_candidates_once(target: &str, playlist: bool) -> Result<Vec<SearchCandidate>> {
+async fn fetch_search_candidates_once(
+    target: &str,
+    playlist: Option<usize>,
+) -> Result<Vec<SearchCandidate>> {
+    // Only one yt-dlp lookup at a time: each one is a Python process (~100MB+).
+    let _permit = YTDL_LOOKUPS.acquire().await?;
     let mut cmd = tokio::process::Command::new(ytdl_program());
     cmd.args([
         "--flat-playlist",
@@ -52,8 +69,15 @@ async fn fetch_search_candidates_once(target: &str, playlist: bool) -> Result<Ve
         "%(id)s\t%(title)s\t%(channel,uploader)s\t%(duration)s\t%(webpage_url,url)s",
         "--no-warnings",
         "--no-check-certificate",
-        if playlist { "--yes-playlist" } else { "--no-playlist" },
+        if playlist.is_some() {
+            "--yes-playlist"
+        } else {
+            "--no-playlist"
+        },
     ]);
+    if let Some(max) = playlist {
+        cmd.args(["--playlist-end", &max.max(1).to_string()]);
+    }
     if Path::new("cookies.txt").exists() {
         cmd.args(["--cookies", "cookies.txt"]);
     }
@@ -89,9 +113,8 @@ async fn fetch_search_candidates_once(target: &str, playlist: bool) -> Result<Ve
         if title.is_empty() || title == "NA" {
             continue;
         }
-        let channel = crate::resolvers::decode_html_entities(
-            parts.get(2).map(|s| s.trim()).unwrap_or(""),
-        );
+        let channel =
+            crate::resolvers::decode_html_entities(parts.get(2).map(|s| s.trim()).unwrap_or(""));
         let duration = parts.get(3).and_then(|s| s.trim().parse::<u64>().ok());
         let url = parts
             .get(4)
@@ -113,14 +136,43 @@ async fn fetch_search_candidates_once(target: &str, playlist: bool) -> Result<Ve
 }
 
 pub const STOP_WORDS: &[&str] = &[
-    "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for",
-    "with", "by", "from", "ft", "feat", "featuring", "vs", "audio",
-    "official", "video", "song", "lyrics", "lyric", "remix", "version",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "with",
+    "by",
+    "from",
+    "ft",
+    "feat",
+    "featuring",
+    "vs",
+    "audio",
+    "official",
+    "video",
+    "song",
+    "lyrics",
+    "lyric",
+    "remix",
+    "version",
 ];
 
 pub fn tokenize_words(text: &str) -> Vec<String> {
     text.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .map(|s| s.to_string())
@@ -195,11 +247,17 @@ pub fn score_candidate(
     }
     if title_lower.contains("official audio") {
         score += 50;
-    } else if title_lower.contains("audio") || title_lower.contains("(audio)") || title_lower.contains("[audio]") {
+    } else if title_lower.contains("audio")
+        || title_lower.contains("(audio)")
+        || title_lower.contains("[audio]")
+    {
         score += 35;
     }
 
-    if title_lower.contains("official lyric video") || title_lower.contains("lyric video") || title_lower.contains("lyrics") {
+    if title_lower.contains("official lyric video")
+        || title_lower.contains("lyric video")
+        || title_lower.contains("lyrics")
+    {
         score += 30;
     }
 
@@ -207,7 +265,11 @@ pub fn score_candidate(
         score += 25;
     }
 
-    if title_lower.contains("album version") || title_lower.contains("original mix") || title_lower.contains("studio version") || title_lower.contains("clean") {
+    if title_lower.contains("album version")
+        || title_lower.contains("original mix")
+        || title_lower.contains("studio version")
+        || title_lower.contains("clean")
+    {
         score += 15;
     }
 
@@ -241,9 +303,8 @@ pub fn score_candidate(
     }
 
     // 6. Query keyword and title match relevance
-    let is_meaningful = |w: &str| {
-        (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !STOP_WORDS.contains(&w)
-    };
+    let is_meaningful =
+        |w: &str| (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !STOP_WORDS.contains(&w);
 
     let q_clean_words: Vec<String> = tokenize_words(query)
         .into_iter()
@@ -284,12 +345,24 @@ pub fn score_candidate(
             .filter(|w| is_meaningful(w.as_str()))
             .collect();
 
-        let in_a_title = words_a.iter().filter(|w| candidate_title_words.contains(w)).count();
-        let in_a_channel = words_a.iter().filter(|w| candidate_channel_words.contains(w)).count();
+        let in_a_title = words_a
+            .iter()
+            .filter(|w| candidate_title_words.contains(w))
+            .count();
+        let in_a_channel = words_a
+            .iter()
+            .filter(|w| candidate_channel_words.contains(w))
+            .count();
         let has_a = in_a_title > 0 || in_a_channel > 0;
 
-        let in_b_title = words_b.iter().filter(|w| candidate_title_words.contains(w)).count();
-        let in_b_channel = words_b.iter().filter(|w| candidate_channel_words.contains(w)).count();
+        let in_b_title = words_b
+            .iter()
+            .filter(|w| candidate_title_words.contains(w))
+            .count();
+        let in_b_channel = words_b
+            .iter()
+            .filter(|w| candidate_channel_words.contains(w))
+            .count();
         let has_b = in_b_title > 0 || in_b_channel > 0;
 
         // If either part is completely missing from both title and channel, reject
@@ -342,7 +415,9 @@ pub fn score_candidate(
         .count();
     if !q_clean_words.is_empty() && total_matches == q_clean_words.len() {
         score += 40;
-    } else if !q_clean_words.is_empty() && (total_matches as f32 / q_clean_words.len() as f32) >= 0.75 {
+    } else if !q_clean_words.is_empty()
+        && (total_matches as f32 / q_clean_words.len() as f32) >= 0.75
+    {
         score += 20;
     }
 
@@ -457,7 +532,8 @@ pub async fn extract_song_info(state: &BotState, query: &str) -> Result<SongInfo
 
     let final_title = if !best.channel.is_empty()
         && best.channel != "NA"
-        && (best.channel.to_lowercase().ends_with("- topic") || best.channel.to_lowercase().contains("- topic"))
+        && (best.channel.to_lowercase().ends_with("- topic")
+            || best.channel.to_lowercase().contains("- topic"))
     {
         let clean_artist = best
             .channel
@@ -465,7 +541,12 @@ pub async fn extract_song_info(state: &BotState, query: &str) -> Result<SongInfo
             .replace("- topic", "")
             .trim()
             .to_string();
-        if !clean_artist.is_empty() && !best.title.to_lowercase().contains(&clean_artist.to_lowercase()) {
+        if !clean_artist.is_empty()
+            && !best
+                .title
+                .to_lowercase()
+                .contains(&clean_artist.to_lowercase())
+        {
             format!("{clean_artist} - {}", best.title)
         } else {
             best.title
@@ -492,17 +573,30 @@ mod tests {
     #[tokio::test]
     async fn test_audio_search_thriller() {
         let state = BotState::new(true);
-        let res = extract_song_info(&state, "Michael Jackson Thriller").await.unwrap();
-        println!("Resolved Thriller: id={}, title={}, url={}", res.id, res.title, res.url);
+        let res = extract_song_info(&state, "Michael Jackson Thriller")
+            .await
+            .unwrap();
+        println!(
+            "Resolved Thriller: id={}, title={}, url={}",
+            res.id, res.title, res.url
+        );
         // Ensure it did not pick the 14-minute official 4K music video (id: sOnqjkJTMaA)
-        assert_ne!(res.id, "sOnqjkJTMaA", "Must not pick the music video with movie intro/extra footage");
+        assert_ne!(
+            res.id, "sOnqjkJTMaA",
+            "Must not pick the music video with movie intro/extra footage"
+        );
     }
 
     #[tokio::test]
     async fn test_audio_search_paparazzi() {
         let state = BotState::new(true);
-        let res = extract_song_info(&state, "Lady Gaga Paparazzi").await.unwrap();
-        println!("Resolved Paparazzi: id={}, title={}, url={}", res.id, res.title, res.url);
+        let res = extract_song_info(&state, "Lady Gaga Paparazzi")
+            .await
+            .unwrap();
+        println!(
+            "Resolved Paparazzi: id={}, title={}, url={}",
+            res.id, res.title, res.url
+        );
         // Ensure it did not pick the 7-minute music video with skits (d2smz_1L2_0 / qStFzmQGQNw)
         assert_ne!(res.id, "d2smz_1L2_0");
         assert_ne!(res.id, "qStFzmQGQNw");
@@ -511,8 +605,13 @@ mod tests {
     #[tokio::test]
     async fn test_audio_search_payphone() {
         let state = BotState::new(true);
-        let res = extract_song_info(&state, "Maroon 5 Payphone").await.unwrap();
-        println!("Resolved Payphone: id={}, title={}, url={}", res.id, res.title, res.url);
+        let res = extract_song_info(&state, "Maroon 5 Payphone")
+            .await
+            .unwrap();
+        println!(
+            "Resolved Payphone: id={}, title={}, url={}",
+            res.id, res.title, res.url
+        );
         // Ensure it did not pick the music video with bank robbery gunfight (id: KRaWnd3LJfs)
         assert_ne!(res.id, "KRaWnd3LJfs");
     }
@@ -528,7 +627,12 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_bts_request() {
         let state = BotState::new(true);
-        let res = extract_song_info(&state, "Michael Jackson Thriller making of behind the scenes").await.unwrap();
+        let res = extract_song_info(
+            &state,
+            "Michael Jackson Thriller making of behind the scenes",
+        )
+        .await
+        .unwrap();
         println!("Resolved explicit BTS: id={}, title={}", res.id, res.title);
         let lower = res.title.to_lowercase();
         assert!(lower.contains("making") || lower.contains("behind") || lower.contains("thriller"));
@@ -537,7 +641,9 @@ mod tests {
     #[tokio::test]
     async fn test_audio_search_white_chorus_ingatlah_aku_di_sini() {
         let state = BotState::new(true);
-        let res = extract_song_info(&state, "White Chorus - Ingatlah Aku Di Sini").await.unwrap();
+        let res = extract_song_info(&state, "White Chorus - Ingatlah Aku Di Sini")
+            .await
+            .unwrap();
         println!("Resolved White Chorus: id={}, title={}", res.id, res.title);
         // Must resolve to the actual song (kuWHPlpRFXY), NEVER to Minggu (ILq7QUKdST8)
         assert_eq!(res.id, "kuWHPlpRFXY");
@@ -566,8 +672,13 @@ mod tests {
         let wrong_score = score_candidate(&wrong_candidate, 0, query, false, false);
         let right_score = score_candidate(&right_candidate, 0, query, false, false);
 
-        assert!(wrong_score <= -5000, "Wrong song by same artist must be rejected, got score: {wrong_score}");
-        assert!(right_score > 50, "Correct song must receive strong positive score, got: {right_score}");
+        assert!(
+            wrong_score <= -5000,
+            "Wrong song by same artist must be rejected, got score: {wrong_score}"
+        );
+        assert!(
+            right_score > 50,
+            "Correct song must receive strong positive score, got: {right_score}"
+        );
     }
 }
-

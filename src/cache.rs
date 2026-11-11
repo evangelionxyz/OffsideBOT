@@ -76,7 +76,7 @@ impl SongCache {
         let now = now_unix_secs();
         let mut changed = false;
 
-        // 1. Remove expired entries (> 7 days TTL) or missing files on disk
+        // 1. Remove expired entries (> 31 days TTL) or missing files on disk
         let expired_ids: Vec<String> = index
             .entries
             .iter()
@@ -138,7 +138,7 @@ impl SongCache {
             }
         }
 
-        // 2. Enforce 5 GB max size using LRU (oldest last_accessed removed first)
+        // 2. Enforce 35 GB max size using LRU (oldest last_accessed removed first)
         let mut total_bytes: u64 = index.entries.values().map(|e| e.size_bytes).sum();
         if total_bytes > MAX_CACHE_BYTES {
             let mut entries_by_age: Vec<(String, u64, String, u64)> = index
@@ -228,18 +228,28 @@ impl SongCache {
                 let title_words = crate::search::tokenize_words(right);
                 let meaningful: Vec<&String> = title_words
                     .iter()
-                    .filter(|w| (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !crate::search::STOP_WORDS.contains(&w.as_str()))
+                    .filter(|w| {
+                        (w.len() > 1 || w.chars().all(|c| c.is_numeric()))
+                            && !crate::search::STOP_WORDS.contains(&w.as_str())
+                    })
                     .collect();
-                if !meaningful.is_empty() && !meaningful.iter().any(|w| cached_title_words.contains(w)) {
+                if !meaningful.is_empty()
+                    && !meaningful.iter().any(|w| cached_title_words.contains(w))
+                {
                     return None;
                 }
             } else {
                 let q_words = crate::search::tokenize_words(query);
                 let meaningful: Vec<&String> = q_words
                     .iter()
-                    .filter(|w| (w.len() > 1 || w.chars().all(|c| c.is_numeric())) && !crate::search::STOP_WORDS.contains(&w.as_str()))
+                    .filter(|w| {
+                        (w.len() > 1 || w.chars().all(|c| c.is_numeric()))
+                            && !crate::search::STOP_WORDS.contains(&w.as_str())
+                    })
                     .collect();
-                if !meaningful.is_empty() && !meaningful.iter().any(|w| cached_title_words.contains(w)) {
+                if !meaningful.is_empty()
+                    && !meaningful.iter().any(|w| cached_title_words.contains(w))
+                {
                     return None;
                 }
             }
@@ -281,7 +291,12 @@ impl SongCache {
         self.save_index_locked(&index).await;
     }
 
-    pub async fn insert_cached_file(&self, song: &SongInfo, query: Option<&str>, file_name: String) {
+    pub async fn insert_cached_file(
+        &self,
+        song: &SongInfo,
+        query: Option<&str>,
+        file_name: String,
+    ) {
         let path = self.file_path(&file_name);
         let Ok(meta) = fs::metadata(&path) else {
             return;
@@ -307,7 +322,9 @@ impl SongCache {
                 },
             );
             if let Some(q) = query {
-                index.queries.insert(Self::normalize_query(q), song.id.clone());
+                index
+                    .queries
+                    .insert(Self::normalize_query(q), song.id.clone());
             }
             self.save_index_locked(&index).await;
         }
@@ -322,4 +339,3 @@ impl SongCache {
         (count, bytes)
     }
 }
-

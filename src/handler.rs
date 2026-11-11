@@ -1,9 +1,7 @@
 use std::{
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
-
-use tokio::sync::Semaphore;
 
 use serenity::{
     async_trait,
@@ -17,16 +15,17 @@ use serenity::{
 };
 
 use crate::{
+    models::SongInfo,
     models::{LoopMode, StayMode},
     playback::{
-        cancel_slot, clear_queue, enqueue_songs, fill_slot, reserve_slots, slot_exists, MAX_QUEUE_LEN, remove_from_queue, reserve_slot, shuffle_queue,
-        skip_current, start_disconnect_timer, stop_playback, FillResult,
+        FillResult, LOOKAHEAD, MAX_QUEUE_LEN, cancel_slot, clear_queue, enqueue_songs, fill_slot,
+        remove_from_queue, reserve_slot, reserve_slots, shuffle_queue, skip_current, slot_exists,
+        slot_position, start_disconnect_timer, stop_playback,
     },
     resolvers::{
         fetch_apple_music_track, fetch_deezer_track, fetch_spotify_collection, fetch_spotify_track,
         parse_spotify_collection_url,
     },
-    models::SongInfo,
     search::{extract_song_info, fetch_playlist_candidates},
     state::BotState,
 };
@@ -69,12 +68,15 @@ async fn queue_spotify_collection(
             }
         })
         .collect();
-    let total = queries.len();
+    let total = tracks.len();
 
     let tickets = reserve_slots(state, guild_id, &queries).await;
     if tickets.is_empty() {
         let _ = channel_id
-            .say(&ctx.http, format!("Queue is full (max {MAX_QUEUE_LEN} songs)."))
+            .say(
+                &ctx.http,
+                format!("Queue is full (max {MAX_QUEUE_LEN} songs)."),
+            )
             .await;
         return;
     }
@@ -89,7 +91,7 @@ async fn queue_spotify_collection(
 
     let queued = tickets.len();
     let mut reply = format!(
-        "Queued {queued} of {total} tracks from Spotify {kind} `{name}`. Finding them on YouTube..."
+        "Queued {queued} of {total} tracks from Spotify {kind} `{name}`. Resolving the next {LOOKAHEAD} on YouTube, the rest as they get closer."
     );
     if wants_loop {
         reply.push_str(" Queue loop is on (`!!loop off` to stop).");
@@ -99,38 +101,29 @@ async fn queue_spotify_collection(
     let ctx = ctx.clone();
     let state = state.clone();
     tokio::spawn(async move {
-        let semaphore = Arc::new(Semaphore::new(3));
-        let mut jobs = Vec::new();
-        for (ticket, query) in tickets.into_iter().zip(queries) {
-            // The semaphore hands out permits in order, so earlier tracks resolve first
-            let Ok(permit) = semaphore.clone().acquire_owned().await else {
-                break;
-            };
-            let ctx = ctx.clone();
-            let state = state.clone();
-            jobs.push(tokio::spawn(async move {
-                let _permit = permit;
-                if !slot_exists(&state, guild_id, ticket).await {
-                    return true; // cleared by the user, not a failure
-                }
-                match extract_song_info(&state, &query).await {
-                    Ok(song) => {
-                        fill_slot(&ctx, &state, guild_id, channel_id, ticket, song).await;
-                        true
-                    }
-                    Err(err) => {
-                        eprintln!("Spotify track not found on YouTube ({query}): {err:?}");
-                        cancel_slot(&ctx, &state, guild_id, channel_id, ticket).await;
-                        false
-                    }
-                }
-            }));
-        }
-
+        // Resolve strictly in order, one at a time, and only while the track is within
+        // the next LOOKAHEAD queue positions. Everything further out stays a cheap text entry.
         let mut failed = 0;
-        for job in jobs {
-            if matches!(job.await, Ok(false)) {
-                failed += 1;
+        for (ticket, query) in tickets.into_iter().zip(queries) {
+            loop {
+                match slot_position(&state, guild_id, ticket).await {
+                    None => break, // cleared or removed by the user
+                    Some(pos) if pos <= LOOKAHEAD => break,
+                    Some(_) => tokio::time::sleep(Duration::from_secs(3)).await,
+                }
+            }
+            if !slot_exists(&state, guild_id, ticket).await {
+                continue;
+            }
+            match extract_song_info(&state, &query).await {
+                Ok(song) => {
+                    fill_slot(&ctx, &state, guild_id, channel_id, ticket, song).await;
+                }
+                Err(err) => {
+                    eprintln!("Spotify track not found on YouTube ({query}): {err:?}");
+                    cancel_slot(&ctx, &state, guild_id, channel_id, ticket).await;
+                    failed += 1;
+                }
             }
         }
         if failed > 0 {
@@ -368,9 +361,20 @@ impl EventHandler for Handler {
         let cmd = content.split_whitespace().next().unwrap_or("");
 
         // Playback controls only work for users sitting in the bot's voice channel
-        const CHANNEL_GATED: &[&str] = &[
-            "!!play", "!!playlist", "!!skip", "!!stop", "!!pause", "!!resume", "!!loop", "!!clear", "!!remove",
-            "!!shuffle", "!!volume", "!!stay", "!!disconnect",
+        const CHANNEL_GATED: &[&str; 13] = &[
+            "!!play",
+            "!!playlist",
+            "!!skip",
+            "!!stop",
+            "!!pause",
+            "!!resume",
+            "!!loop",
+            "!!clear",
+            "!!remove",
+            "!!shuffle",
+            "!!volume",
+            "!!stay",
+            "!!disconnect",
         ];
         if CHANNEL_GATED.contains(&cmd) && !in_bot_channel(&ctx, guild_id, msg.author.id).await {
             let _ = msg
@@ -413,7 +417,10 @@ impl EventHandler for Handler {
             if parse_spotify_collection_url(&query).is_some() {
                 let _ = msg
                     .channel_id
-                    .say(&ctx.http, "That is a Spotify playlist/album. Use `!!playlist <url>` instead.")
+                    .say(
+                        &ctx.http,
+                        "That is a Spotify playlist/album. Use `!!playlist <url>` instead.",
+                    )
                     .await;
                 return;
             }
@@ -429,10 +436,7 @@ impl EventHandler for Handler {
                     }
                     Err(err) => {
                         eprintln!("Error joining voice channel: {err:?}");
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("Error: {err}"))
-                            .await;
+                        let _ = msg.channel_id.say(&ctx.http, format!("Error: {err}")).await;
                         return;
                     }
                 }
@@ -482,10 +486,7 @@ impl EventHandler for Handler {
                 }
                 Err(err) => {
                     eprintln!("Error during link lookup: {err:?}");
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, format!("Error: {err}"))
-                        .await;
+                    let _ = msg.channel_id.say(&ctx.http, format!("Error: {err}")).await;
                     cancel_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket).await;
                     return;
                 }
@@ -497,8 +498,15 @@ impl EventHandler for Handler {
                         self.state.cache.remember_query(&query, &song_info.id).await;
                     }
                     let title = song_info.title.clone();
-                    match fill_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket, song_info)
-                        .await
+                    match fill_slot(
+                        &ctx,
+                        &self.state,
+                        guild_id,
+                        msg.channel_id,
+                        ticket,
+                        song_info,
+                    )
+                    .await
                     {
                         FillResult::Queued(position) => {
                             let _ = msg
@@ -514,10 +522,7 @@ impl EventHandler for Handler {
                 }
                 Err(err) => {
                     eprintln!("Error during playback setup: {err:?}");
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, format!("Error: {err}"))
-                        .await;
+                    let _ = msg.channel_id.say(&ctx.http, format!("Error: {err}")).await;
                     cancel_slot(&ctx, &self.state, guild_id, msg.channel_id, ticket).await;
                 }
             }
@@ -557,10 +562,7 @@ impl EventHandler for Handler {
                         let _ = call.lock().await.deafen(true).await;
                     }
                     Err(err) => {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("Error: {err}"))
-                            .await;
+                        let _ = msg.channel_id.say(&ctx.http, format!("Error: {err}")).await;
                         return;
                     }
                 }
@@ -580,19 +582,13 @@ impl EventHandler for Handler {
                 return;
             }
 
-            let _ = msg
-                .channel_id
-                .say(&ctx.http, "Loading playlist...")
-                .await;
+            let _ = msg.channel_id.say(&ctx.http, "Loading playlist...").await;
 
             let candidates = match fetch_playlist_candidates(&url, MAX_QUEUE_LEN).await {
                 Ok(list) => list,
                 Err(err) => {
                     eprintln!("Error loading playlist: {err:?}");
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, format!("Error: {err}"))
-                        .await;
+                    let _ = msg.channel_id.say(&ctx.http, format!("Error: {err}")).await;
                     return;
                 }
             };
@@ -640,7 +636,8 @@ impl EventHandler for Handler {
             if wants_loop {
                 reply.push_str(" Queue loop is on (`!!loop off` to stop).");
             }
-            let _ = msg.channel_id.say(&ctx.http, reply).await;        } else if cmd == "!!queue" {
+            let _ = msg.channel_id.say(&ctx.http, reply).await;
+        } else if cmd == "!!queue" {
             let (entries, total) = {
                 let queues = self.state.queues.lock().await;
                 match queues.get(&guild_id) {
@@ -691,7 +688,10 @@ impl EventHandler for Handler {
                     Some(entry) => {
                         let _ = msg
                             .channel_id
-                            .say(&ctx.http, format!("Removed `{}` from the queue.", entry.label()))
+                            .say(
+                                &ctx.http,
+                                format!("Removed `{}` from the queue.", entry.label()),
+                            )
                             .await;
                     }
                     None => {
@@ -717,7 +717,13 @@ impl EventHandler for Handler {
             };
             let _ = msg.channel_id.say(&ctx.http, reply).await;
         } else if cmd == "!!nowplaying" || cmd == "!!np" {
-            let current = self.state.current_songs.lock().await.get(&guild_id).cloned();
+            let current = self
+                .state
+                .current_songs
+                .lock()
+                .await
+                .get(&guild_id)
+                .cloned();
             let handle = {
                 let tracks = self.state.current_tracks.lock().await;
                 tracks.get(&guild_id).map(|t| t.handle.clone())
@@ -744,10 +750,7 @@ impl EventHandler for Handler {
                         .await;
                 }
                 _ => {
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, "Nothing is playing.")
-                        .await;
+                    let _ = msg.channel_id.say(&ctx.http, "Nothing is playing.").await;
                 }
             }
         } else if cmd == "!!volume" {
@@ -765,7 +768,10 @@ impl EventHandler for Handler {
                     .channel_id
                     .say(
                         &ctx.http,
-                        format!("Volume: `{:.0}%`. Usage: `!!volume <0-200>`", volume * 100.0),
+                        format!(
+                            "Volume: `{:.0}%`. Usage: `!!volume <0-200>`",
+                            volume * 100.0
+                        ),
                     )
                     .await;
             } else if let Ok(percent) = arg.trim_end_matches('%').parse::<f32>() {
@@ -797,10 +803,7 @@ impl EventHandler for Handler {
             }
         } else if cmd == "!!skip" {
             if skip_current(&ctx, &self.state, guild_id, msg.channel_id).await {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "Skipped to next song.")
-                    .await;
+                let _ = msg.channel_id.say(&ctx.http, "Skipped to next song.").await;
             } else {
                 let _ = msg.channel_id.say(&ctx.http, "Nothing to skip.").await;
             }
@@ -824,10 +827,7 @@ impl EventHandler for Handler {
                     }
                 }
             } else {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "No music is playing.")
-                    .await;
+                let _ = msg.channel_id.say(&ctx.http, "No music is playing.").await;
             }
         } else if cmd == "!!resume" {
             if self.state.is_paused(guild_id).await {
@@ -843,13 +843,14 @@ impl EventHandler for Handler {
                     }
                 }
             } else {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "No music is paused.")
-                    .await;
+                let _ = msg.channel_id.say(&ctx.http, "No music is paused.").await;
             }
         } else if cmd == "!!loop" {
-            let arg = content.strip_prefix("!!loop").unwrap_or("").trim().to_lowercase();
+            let arg = content
+                .strip_prefix("!!loop")
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
             let mut modes = self.state.loop_modes.lock().await;
             let current = modes.get(&guild_id).copied().unwrap_or_default();
             let next = match arg.as_str() {
@@ -895,14 +896,15 @@ impl EventHandler for Handler {
 
                 start_disconnect_timer(ctx.clone(), self.state.clone(), guild_id, msg.channel_id);
             } else {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "No music is playing.")
-                    .await;
+                let _ = msg.channel_id.say(&ctx.http, "No music is playing.").await;
                 self.state.cancel_disconnect_timer(guild_id).await;
             }
         } else if cmd == "!!stay" {
-            let arg = content.strip_prefix("!!stay").unwrap_or("").trim().to_lowercase();
+            let arg = content
+                .strip_prefix("!!stay")
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
 
             if arg.is_empty() {
                 let mode = self
@@ -985,11 +987,19 @@ impl EventHandler for Handler {
                     .await
                     .insert(guild_id, StayMode::Default);
                 if !self.state.is_playing(guild_id).await {
-                    start_disconnect_timer(ctx.clone(), self.state.clone(), guild_id, msg.channel_id);
+                    start_disconnect_timer(
+                        ctx.clone(),
+                        self.state.clone(),
+                        guild_id,
+                        msg.channel_id,
+                    );
                 }
                 let _ = msg
                     .channel_id
-                    .say(&ctx.http, "Stay mode reset to default (2 minutes of inactivity).")
+                    .say(
+                        &ctx.http,
+                        "Stay mode reset to default (2 minutes of inactivity).",
+                    )
                     .await;
             } else if let Ok(hours) = arg.parse::<f64>() {
                 if hours > 0.0 && hours.is_finite() {
@@ -1059,7 +1069,9 @@ impl EventHandler for Handler {
                 .channel_id
                 .say(
                     &ctx.http,
-                    format!("Cached songs: `{count}` (`{mb:.2} MB` / `35,840.00 MB`, TTL: 31 days)"),
+                    format!(
+                        "Cached songs: `{count}` (`{mb:.2} MB` / `35,840.00 MB`, TTL: 31 days)"
+                    ),
                 )
                 .await;
         } else if cmd == "!!help" {
@@ -1096,4 +1108,3 @@ impl EventHandler for Handler {
         }
     }
 }
-

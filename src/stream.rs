@@ -7,10 +7,10 @@ use std::{
     sync::{Arc, LazyLock, Mutex as StdMutex},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use songbird::input::{
-    core::io::{MediaSource, ReadOnlySource},
     AudioStream, Input, LiveInput,
+    core::io::{MediaSource, ReadOnlySource},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use crate::{
-    cache::{now_unix_secs, SongCache, MAX_CACHE_BYTES},
+    cache::{MAX_CACHE_BYTES, SongCache, now_unix_secs},
     models::SongInfo,
 };
 
@@ -27,6 +27,8 @@ use crate::{
 /// write the same cache file at the same time.
 static INFLIGHT: LazyLock<StdMutex<HashSet<String>>> =
     LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+static PREFETCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 pub struct InflightGuard(String);
 
@@ -208,6 +210,10 @@ pub fn prefetch_song_in_background(song: SongInfo, cache: Arc<SongCache>) {
             return;
         }
         let Some(_guard) = try_begin_download(&song.id) else {
+            return;
+        };
+        // Never run more than one background download at a time.
+        let Ok(_permit) = PREFETCH_SLOTS.acquire().await else {
             return;
         };
 

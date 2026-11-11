@@ -1,24 +1,24 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serenity::{
     async_trait,
     client::Context,
     model::id::{ChannelId, GuildId},
 };
 use songbird::{
+    Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent,
     input::{
-        codecs::{get_codec_registry, get_probe},
         Input,
+        codecs::{get_codec_registry, get_probe},
     },
     tracks::PlayMode,
-    Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent,
 };
 
 use crate::{
@@ -115,6 +115,10 @@ pub fn start_disconnect_timer(
 }
 
 pub const MAX_QUEUE_LEN: usize = 100;
+
+/// How many upcoming tracks are resolved/downloaded ahead of time. The rest of a
+/// long queue stays as lightweight entries so small servers don't run out of RAM.
+pub const LOOKAHEAD: usize = 3;
 
 async fn build_input(state: &Arc<BotState>, song: &SongInfo) -> Result<Input> {
     // Play straight from the disk cache when possible (streamed from disk, not loaded into RAM),
@@ -290,7 +294,7 @@ pub async fn fill_slot(
     } else {
         // Download in the background so it starts instantly when its turn comes
         // (only for the next few songs, so big playlists don't spawn dozens of downloads)
-        if position <= 3 {
+        if position <= LOOKAHEAD {
             prefetch_song_in_background(song, state.cache.clone());
         }
         FillResult::Queued(position)
@@ -491,8 +495,8 @@ async fn play_next_locked(
                     song: Some(next_song.clone()),
                 });
             }
-            // Warm the cache for whatever plays next
-            if let Some(upcoming) = queue.front().and_then(|e| e.song.clone()) {
+            // Warm the cache for the next few songs (downloads run one at a time)
+            for upcoming in queue.iter().take(LOOKAHEAD).filter_map(|e| e.song.clone()) {
                 prefetch_song_in_background(upcoming, state.cache.clone());
             }
         }
@@ -602,6 +606,17 @@ pub async fn reserve_slots(
 
     state.cancel_disconnect_timer(guild_id).await;
     tickets
+}
+
+/// 1-based position of a reserved slot in the queue, or `None` if it's gone.
+pub async fn slot_position(state: &Arc<BotState>, guild_id: GuildId, ticket: u64) -> Option<usize> {
+    state
+        .queues
+        .lock()
+        .await
+        .get(&guild_id)
+        .and_then(|q| q.iter().position(|e| e.ticket == ticket))
+        .map(|i| i + 1)
 }
 
 /// True while the reserved slot is still waiting in the queue (not cleared or removed).
